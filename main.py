@@ -41,6 +41,10 @@ ERROR_RETRY_DELAY_SECONDS = 10
 MIN_VOLUME_FOR_ALERT = 1_000_000  # Only alert on events with >$1M volume
 MAX_TOKENS_TO_CHECK = 10  # Limit security checks per cycle
 
+# Noise Gate: Token freshness and liquidity filters
+MIN_LIQUIDITY_FOR_ALERT = 5_000  # Only alert if liquidity > $5K
+MAX_TOKEN_AGE_HOURS = 24  # Only alert on tokens created < 24h ago
+
 # Telegram (set via environment or .env file)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -191,14 +195,31 @@ def process_event(event: dict) -> list[dict]:
     # Step 3: Security check (only for Solana tokens, limit to avoid rate limits)
     safe_tokens = []
     checked = 0
+    current_time_ms = int(datetime.now().timestamp() * 1000)
+    max_age_ms = MAX_TOKEN_AGE_HOURS * 60 * 60 * 1000  # Convert hours to milliseconds
     
     for token in tokens[:MAX_TOKENS_TO_CHECK]:
         address = token.get("address", "")
         chain = token.get("chain", "").lower()
+        liquidity = float(token.get("liquidity_usd", 0) or 0)
+        pair_created_at = token.get("pair_created_at", 0)
         
         # Skip if already alerted
         if address.lower() in ALERTED_TOKENS:
             continue
+        
+        # NOISE GATE: Check liquidity threshold
+        if liquidity < MIN_LIQUIDITY_FOR_ALERT:
+            print(f"   {Fore.YELLOW}⏭️  Skipping {token['symbol']}: Low liquidity (${liquidity:.0f}){Style.RESET_ALL}")
+            continue
+        
+        # NOISE GATE: Check token age (must be fresh < 24h)
+        if pair_created_at > 0:
+            age_ms = current_time_ms - pair_created_at
+            age_hours = age_ms / (1000 * 60 * 60)
+            if age_hours > MAX_TOKEN_AGE_HOURS:
+                print(f"   {Fore.YELLOW}⏭️  Skipping {token['symbol']}: Stale token ({age_hours:.1f}h old){Style.RESET_ALL}")
+                continue
         
         # Only check Solana tokens with RugCheck (others pass by default)
         if chain == "solana":

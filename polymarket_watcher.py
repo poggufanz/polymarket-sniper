@@ -19,6 +19,9 @@ REFRESH_INTERVAL_SECONDS = 30
 RETRY_DELAY_SECONDS = 5
 REQUEST_TIMEOUT_SECONDS = 15
 
+# Noise Gate: Minimum volume threshold (USD)
+MIN_VOLUME_FILTER = 50_000  # Only process events with volume > $50K
+
 
 def format_volume(volume: float) -> str:
     """
@@ -58,7 +61,16 @@ def fetch_events() -> Optional[list[dict]]:
     try:
         response = requests.get(API_URL, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
         response.raise_for_status()
-        return response.json()
+        events = response.json()
+        
+        # Apply volume filter - only keep high-conviction events
+        filtered_events = []
+        for event in events:
+            volume = float(event.get("volume", 0) or 0)
+            if volume >= MIN_VOLUME_FILTER:
+                filtered_events.append(event)
+        
+        return filtered_events
     except requests.exceptions.RequestException as e:
         print(f"{Fore.RED}❌ API Error: {e}{Style.RESET_ALL}")
         return None

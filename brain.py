@@ -40,13 +40,36 @@ STOP_WORDS: Set[str] = {
     "this", "that", "these", "those", "here", "there",
 }
 
-# High-value keywords to always prioritize (crypto, politics, tech)
+# High-value keywords to always prioritize (politics, tech, scandals)
 PRIORITY_KEYWORDS: Set[str] = {
-    "bitcoin", "btc", "ethereum", "eth", "crypto", "solana", "sol",
     "trump", "biden", "musk", "elon", "vance",
     "tiktok", "twitter", "meta", "google", "apple", "nvidia", "tesla",
     "war", "russia", "ukraine", "china", "israel", "iran",
     "fed", "inflation", "recession", "election",
+    "scandal", "resign", "impeach", "arrest", "indicted",
+}
+
+# ==============================================================================
+# NOISE GATE: Blacklist for Sports & Crypto Price Bets
+# ==============================================================================
+# These topics rarely create viral meme coins - we want narratives!
+BLACKLIST: Set[str] = {
+    # Sports - boring for meme coins
+    "nfl", "nba", "mlb", "nhl", "ufc", "wwe",
+    "premier league", "champions league", "la liga", "bundesliga",
+    "super bowl", "world cup", "world series",
+    "lakers", "celtics", "warriors", "yankees", "cowboys", "patriots",
+    "man city", "manchester", "liverpool", "arsenal", "chelsea", "barcelona", "real madrid",
+    "playoffs", "championship", "finals", "mvp",
+    # Crypto price bets - not narrative driven
+    "bitcoin", "btc", "ethereum", "eth", "solana", "sol",
+    "price", "above", "below", "ath", "all-time high",
+    "$100k", "$50k", "$10k",
+    # Pop culture noise
+    "taylor swift", "grammys", "oscars", "emmys",
+    "box office", "album", "tour",
+    # Weather/misc
+    "temperature", "weather", "hurricane",
 }
 
 
@@ -124,6 +147,12 @@ def extract_keywords(title: str) -> List[str]:
         List of up to 3 keywords in UPPERCASE.
     """
     original_title = title
+    title_lower = title.lower()
+    
+    # NOISE GATE: Check blacklist first
+    for banned in BLACKLIST:
+        if banned in title_lower:
+            return []  # Skip this event entirely
     
     # Step 1: Remove dates first
     title = remove_dates(title)
