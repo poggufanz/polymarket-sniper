@@ -203,6 +203,9 @@ async def handle_token_event(event: TokenEvent) -> None:
     """
     timestamp = datetime.now().strftime("%H:%M:%S")
     
+    # Track scan start
+    StateManager.increment_stat("tokens_scanned")
+    
     logger.info(f"\n{'='*60}")
     logger.info(f"TOKEN EVENT RECEIVED @ {timestamp}")
     logger.info(f"{'='*60}")
@@ -216,16 +219,19 @@ async def handle_token_event(event: TokenEvent) -> None:
     mint_address = event.mint_address
     if not mint_address:
         logger.warning("No mint address available, skipping event")
+        StateManager.increment_stat("no_data")
         return
     
     # Check if already alerted on this token today
     if StateManager.was_alerted_today(mint_address):
         logger.info(f"Already alerted on {event.token_symbol or mint_address[:16]} today, skipping")
+        StateManager.increment_stat("duplicate")
         return
     
     # Check if we have alerts remaining
     if not StateManager.can_alert(config.MAX_ALERTS_PER_DAY):
         logger.warning(f"Daily alert limit reached ({config.MAX_ALERTS_PER_DAY}), skipping")
+        StateManager.increment_stat("daily_limit")
         return
     
     try:
@@ -243,6 +249,7 @@ async def handle_token_event(event: TokenEvent) -> None:
         
         if not token_data:
             logger.warning(f"No DexScreener data for {mint_address[:16]}, skipping")
+            StateManager.increment_stat("no_data")
             return
         
         # Extract basic info
@@ -256,6 +263,7 @@ async def handle_token_event(event: TokenEvent) -> None:
         # Quick liquidity check
         if liquidity < config.MIN_LIQUIDITY_USD:
             logger.info(f"Liquidity ${liquidity:.0f} below threshold ${config.MIN_LIQUIDITY_USD}, skipping")
+            StateManager.increment_stat("low_liquidity")
             return
         
         # =================================================================
@@ -276,11 +284,13 @@ async def handle_token_event(event: TokenEvent) -> None:
         # EARLY phase required
         if pump_phase != "EARLY":
             logger.info(f"Pump phase is {pump_phase} (not EARLY), skipping")
+            StateManager.increment_stat("late_pump")
             return
         
         # Not stale required
         if is_stale:
             logger.info("Token is stale (old + flat price), skipping")
+            StateManager.increment_stat("stale")
             return
         
         # =================================================================
@@ -367,6 +377,7 @@ async def handle_token_event(event: TokenEvent) -> None:
         
         if not is_safe:
             logger.info(f"Security check FAILED: {danger_flags}")
+            StateManager.increment_stat("security_fail")
             return
         
         # =================================================================
@@ -432,6 +443,7 @@ async def handle_token_event(event: TokenEvent) -> None:
         # Check if alert should be sent
         if not should_alert(score_data):
             logger.info("Composite score below alert threshold, skipping")
+            StateManager.increment_stat("low_score")
             return
         
         # =================================================================
@@ -564,6 +576,10 @@ async def run_orchestrator() -> None:
         # Print state info
         alerts_count, _, _ = StateManager.get_alert_history()
         print(f"Alerts Sent Today: {alerts_count}/{config.MAX_ALERTS_PER_DAY}")
+        
+        # Print daily scan stats
+        print()
+        print(StateManager.get_stats_summary())
 
 
 def main() -> None:

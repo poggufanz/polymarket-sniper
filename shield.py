@@ -19,6 +19,7 @@ import time
 
 from rate_limiter import rate_limit_rugcheck, rate_limit, rate_limit_dexscreener
 import config
+from state import StateManager
 
 # Initialize colorama
 init(autoreset=True)
@@ -1077,12 +1078,28 @@ def comprehensive_security_check(
         results["safety_score"] -= 10
     
     # Tier 5: Cabal topology detection (if enabled)
-    if config.ENABLE_CABAL_TRACING and holder_addresses:
+    # Check cache first to save Helius credits (only if tracing is enabled)
+    cabal_cached = False
+    if config.ENABLE_CABAL_TRACING and config.ENABLE_CABAL_CACHING and StateManager.was_cabal_traced(mint_address):
+        cabal_cached = True
+        if verbose:
+            print(f"\n{Fore.WHITE}[5/5] Cabal Topology Detection: CACHED (previously traced){Style.RESET_ALL}")
+        results["cabal_topology"] = {
+            "is_cabal": False,  # Safe default for cached tokens
+            "level": LEVEL_OK,
+            "common_funders": [],
+            "reason": "Cached - previously traced as safe"
+        }
+    elif config.ENABLE_CABAL_TRACING and holder_addresses:
         if verbose:
             print(f"\n{Fore.WHITE}[5/5] Cabal Topology Detection{Style.RESET_ALL}")
         
         cabal_result = check_cabal_topology(holder_addresses, verbose=verbose)
         results["cabal_topology"] = cabal_result
+        
+        # Record that we've traced this token (only if trace completed successfully)
+        if config.ENABLE_CABAL_CACHING and cabal_result.get("level") != LEVEL_UNKNOWN:
+            StateManager.record_cabal_traced(mint_address)
         
         if cabal_result["level"] == LEVEL_DANGER:
             results["danger_flags"].append(f"Cabal: {cabal_result['reason']}")

@@ -106,6 +106,7 @@ USE_MOCK_DATA = os.getenv("USE_MOCK_DATA", "false").lower() == "true"
 
 # Advanced feature flags (graceful degradation)
 ENABLE_CABAL_TRACING = True
+ENABLE_CABAL_CACHING = True  # Cache cabal trace results to save Helius credits
 ENABLE_TECHNICALS = True
 ENABLE_LIQUIDITY_ANALYSIS = True
 

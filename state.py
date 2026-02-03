@@ -25,7 +25,7 @@ class StateManager:
     STATE_FILE = "state.json"
     
     # Schema version for future compatibility
-    SCHEMA_VERSION = "1.0"
+    SCHEMA_VERSION = "1.1"
     
     @staticmethod
     def get_default_state() -> Dict:
@@ -41,6 +41,21 @@ class StateManager:
             "date": today,
             "alerts_today": 0,
             "alerted_tokens": [],  # Token mints that triggered alerts today
+            "processed_cabal_tokens": [],  # Tokens that have been cabal-traced (cached)
+            "stats": {  # Scan statistics
+                "tokens_scanned": 0,
+                "tokens_rejected": 0,
+                "rejected_by_reason": {
+                    "low_liquidity": 0,
+                    "late_pump": 0,
+                    "stale": 0,
+                    "security_fail": 0,
+                    "low_score": 0,
+                    "daily_limit": 0,
+                    "duplicate": 0,
+                    "no_data": 0
+                }
+            },
             "last_reset": datetime.utcnow().isoformat(),
             "metadata": {
                 "bot_version": "2.0-overhaul",
@@ -65,6 +80,9 @@ class StateManager:
             with open(StateManager.STATE_FILE, 'r') as f:
                 state = json.load(f)
             logger.info(f"[STATE] Loaded state from {StateManager.STATE_FILE}")
+            
+            # Migrate state if needed (before date check)
+            state = StateManager._migrate_state(state)
             
             # Check if date has changed (new day)
             state = StateManager._check_date_reset(state)
@@ -114,7 +132,57 @@ class StateManager:
             state["date"] = today
             state["alerts_today"] = 0
             state["alerted_tokens"] = []
+            state["processed_cabal_tokens"] = []
+            # Reset stats for new day
+            state["stats"] = StateManager.get_default_state()["stats"]
             state["last_reset"] = datetime.utcnow().isoformat()
+        
+        return state
+    
+    @staticmethod
+    def _migrate_state(state: Dict) -> Dict:
+        """Migrate state from older schema versions to current.
+        
+        Args:
+            state (dict): Current state that may need migration.
+            
+        Returns:
+            dict: Migrated state.
+        """
+        schema_version = state.get("schema_version", "1.0")
+        
+        # Migrate from 1.0 to 1.1
+        if schema_version == "1.0":
+            logger.info("[STATE] Migrating state from schema 1.0 to 1.1")
+            
+            # Add new fields with defaults
+            if "processed_cabal_tokens" not in state:
+                state["processed_cabal_tokens"] = []
+            
+            if "stats" not in state:
+                state["stats"] = {
+                    "tokens_scanned": 0,
+                    "tokens_rejected": 0,
+                    "rejected_by_reason": {
+                        "low_liquidity": 0,
+                        "late_pump": 0,
+                        "stale": 0,
+                        "security_fail": 0,
+                        "low_score": 0,
+                        "daily_limit": 0,
+                        "duplicate": 0,
+                        "no_data": 0
+                    }
+                }
+            
+            state["schema_version"] = "1.1"
+            StateManager.save_state(state)
+            logger.info("[STATE] Migration to 1.1 complete")
+        
+        # Future migrations can be added here
+        # if schema_version == "1.1":
+        #     # Migrate to 1.2
+        #     pass
         
         return state
     
@@ -217,6 +285,137 @@ class StateManager:
         logger.warning("[STATE] Force resetting state (manual reset)")
         state = StateManager.get_default_state()
         return StateManager.save_state(state)
+    
+    # =========================================================================
+    # CABAL CACHING METHODS
+    # =========================================================================
+    
+    @staticmethod
+    def was_cabal_traced(token_mint: str) -> bool:
+        """Check if a token has already been cabal-traced today.
+        
+        Args:
+            token_mint (str): Token mint address.
+            
+        Returns:
+            bool: True if already traced (cached).
+        """
+        state = StateManager.load_state()
+        return token_mint in state.get("processed_cabal_tokens", [])
+    
+    @staticmethod
+    def record_cabal_traced(token_mint: str) -> bool:
+        """Record that a token has been cabal-traced.
+        
+        Args:
+            token_mint (str): Token mint address.
+            
+        Returns:
+            bool: True if recorded successfully.
+        """
+        state = StateManager.load_state()
+        
+        # Initialize if missing (backward compat)
+        if "processed_cabal_tokens" not in state:
+            state["processed_cabal_tokens"] = []
+        
+        if token_mint not in state["processed_cabal_tokens"]:
+            state["processed_cabal_tokens"].append(token_mint)
+            success = StateManager.save_state(state)
+            if success:
+                logger.debug(f"[STATE] Recorded cabal trace for {token_mint[:16]}...")
+            return success
+        return True  # Already recorded
+    
+    # =========================================================================
+    # STATISTICS METHODS
+    # =========================================================================
+    
+    @staticmethod
+    def increment_stat(stat_name: str, amount: int = 1) -> bool:
+        """Increment a statistic counter.
+        
+        Args:
+            stat_name (str): Name of the stat to increment.
+                Can be: "tokens_scanned", "tokens_rejected", or a rejection reason
+                like "low_liquidity", "late_pump", "stale", "security_fail",
+                "low_score", "daily_limit", "duplicate", "no_data".
+            amount (int): Amount to increment by (default 1).
+            
+        Returns:
+            bool: True if incremented successfully.
+        """
+        state = StateManager.load_state()
+        
+        # Initialize stats if missing (backward compat)
+        if "stats" not in state:
+            state["stats"] = StateManager.get_default_state()["stats"]
+        
+        stats = state["stats"]
+        
+        # Direct stats (tokens_scanned, tokens_rejected)
+        if stat_name in ("tokens_scanned", "tokens_rejected"):
+            stats[stat_name] = stats.get(stat_name, 0) + amount
+        # Rejection reasons
+        elif stat_name in stats.get("rejected_by_reason", {}):
+            stats["rejected_by_reason"][stat_name] = stats["rejected_by_reason"].get(stat_name, 0) + amount
+            # Also increment total rejected count
+            stats["tokens_rejected"] = stats.get("tokens_rejected", 0) + amount
+        else:
+            logger.warning(f"[STATE] Unknown stat name: {stat_name}")
+            return False
+        
+        state["stats"] = stats
+        return StateManager.save_state(state)
+    
+    @staticmethod
+    def get_stats() -> Dict:
+        """Get current statistics.
+        
+        Returns:
+            dict: Current statistics with keys:
+                - tokens_scanned: Total tokens processed
+                - tokens_rejected: Total tokens rejected
+                - rejected_by_reason: Breakdown by rejection reason
+        """
+        state = StateManager.load_state()
+        
+        # Return default stats if not present
+        if "stats" not in state:
+            return StateManager.get_default_state()["stats"]
+        
+        return state["stats"]
+    
+    @staticmethod
+    def get_stats_summary() -> str:
+        """Get a formatted summary of today's statistics.
+        
+        Returns:
+            str: Formatted statistics summary.
+        """
+        stats = StateManager.get_stats()
+        
+        scanned = stats.get("tokens_scanned", 0)
+        rejected = stats.get("tokens_rejected", 0)
+        passed = scanned - rejected if scanned >= rejected else 0
+        
+        summary_lines = [
+            f"📊 Daily Statistics",
+            f"  Scanned: {scanned}",
+            f"  Passed: {passed}",
+            f"  Rejected: {rejected}",
+        ]
+        
+        # Add rejection breakdown if any rejections
+        if rejected > 0:
+            reasons = stats.get("rejected_by_reason", {})
+            summary_lines.append("  Rejection Reasons:")
+            for reason, count in reasons.items():
+                if count > 0:
+                    reason_label = reason.replace("_", " ").title()
+                    summary_lines.append(f"    - {reason_label}: {count}")
+        
+        return "\n".join(summary_lines)
 
 
 def display_state_info():
@@ -240,6 +439,20 @@ def display_state_info():
         print("  (none)")
     print()
     print(f"Alerts Remaining: {StateManager.get_alerts_remaining()}")
+    print()
+    
+    # Show cabal cache info
+    cabal_tokens = state.get('processed_cabal_tokens', [])
+    print(f"Cabal-Traced Tokens (Cached): {len(cabal_tokens)}")
+    if cabal_tokens:
+        for token in cabal_tokens[:5]:  # Show first 5
+            print(f"  - {token[:30]}...")
+        if len(cabal_tokens) > 5:
+            print(f"  ... and {len(cabal_tokens) - 5} more")
+    print()
+    
+    # Show stats
+    print(StateManager.get_stats_summary())
 
 
 if __name__ == "__main__":
