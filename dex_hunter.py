@@ -9,6 +9,7 @@ import time
 import requests
 from typing import Optional
 from colorama import init, Fore, Style
+from rate_limiter import rate_limit_dexscreener
 
 # Initialize colorama
 init(autoreset=True)
@@ -21,9 +22,10 @@ RATE_LIMIT_DELAY_SECONDS = 0.5
 # Filter thresholds
 MIN_LIQUIDITY_USD = 1000
 MIN_VOLUME_24H_USD = 500
-ALLOWED_CHAINS = {"solana", "base", "ethereum"}
+ALLOWED_CHAINS = {"solana"}
 
 
+@rate_limit_dexscreener
 def fetch_dex_results(keyword: str) -> Optional[list[dict]]:
     """
     Fetch token search results from DexScreener for a given keyword.
@@ -55,7 +57,7 @@ def apply_alpha_filter(pairs: list[dict]) -> list[dict]:
     Criteria:
     - liquidity.usd > 1000
     - volume.h24 > 500
-    - chainId in ['solana', 'base', 'ethereum']
+    - chainId in ALLOWED_CHAINS
     
     Args:
         pairs: Raw list of pair data from DexScreener.

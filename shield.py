@@ -8,6 +8,7 @@ scams, honeypots, and high-risk tokens.
 import requests
 from typing import Optional, Tuple
 from colorama import init, Fore, Style
+from rate_limiter import rate_limit_rugcheck
 
 # Initialize colorama
 init(autoreset=True)
@@ -22,6 +23,7 @@ DANGER_LEVELS = {"danger", "high", "critical", "honeypot", "scam", "rug"}
 SAFE_LEVELS = {"good", "safe", "low", "ok", "verified"}
 
 
+@rate_limit_rugcheck
 def check_security(mint_address: str, verbose: bool = True) -> Tuple[bool, str]:
     """
     Check if a Solana token is safe using RugCheck API.
