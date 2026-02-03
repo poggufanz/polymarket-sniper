@@ -56,6 +56,8 @@ DEXSCREENER_RPM = 30  # DexScreener free tier: 300 req/10 minutes
 GEMINI_RPM = 60  # Gemini: 60 requests per minute default
 RUGCHECK_RPM = 10  # RugCheck: Conservative limit
 SOLANA_RPC_RPM = 20  # Solana RPC: Conservative for shared endpoints
+GECKOTERMINAL_RPM = 30  # GeckoTerminal free tier (no API key needed)
+METEORA_RPM = 30  # Meteora DLMM API
 
 # ============================================================================
 # SOLANA RPC ENDPOINTS
@@ -70,6 +72,16 @@ else:
     # Fallback to public RPC (rate limited)
     SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
     WSS_ENDPOINT = os.getenv("WSS_ENDPOINT", "wss://api.mainnet-beta.solana.com")
+
+# ============================================================================
+# EXTERNAL API ENDPOINTS
+# ============================================================================
+
+# GeckoTerminal (FREE - no key needed!)
+GECKOTERMINAL_API_URL = "https://api.geckoterminal.com/api/v2"
+
+# Meteora DLMM
+METEORA_API_URL = "https://dlmm-api.meteora.ag"
 
 # ============================================================================
 # API KEYS (from environment variables)
@@ -91,6 +103,39 @@ VERBOSE_LOGGING = os.getenv("VERBOSE_LOGGING", "false").lower() == "true"
 
 # Use mock data for testing
 USE_MOCK_DATA = os.getenv("USE_MOCK_DATA", "false").lower() == "true"
+
+# Advanced feature flags (graceful degradation)
+ENABLE_CABAL_TRACING = True
+ENABLE_TECHNICALS = True
+ENABLE_LIQUIDITY_ANALYSIS = True
+
+# ============================================================================
+# CABAL DETECTION THRESHOLDS
+# ============================================================================
+
+CABAL_TRACE_TIMEOUT_SECONDS = 5
+CABAL_TOP_HOLDERS_LIMIT = 5  # Only trace top N holders
+CABAL_COMMON_FUNDER_THRESHOLD = 3  # Min holders from same funder = DANGER
+CABAL_FUNDING_LOOKBACK_HOURS = 24
+
+# ============================================================================
+# TECHNICAL INDICATORS THRESHOLDS
+# ============================================================================
+
+RSI_PERIOD = 14
+RSI_OVERSOLD = 30
+RSI_OVERBOUGHT = 70
+EMA_SHORT_PERIOD = 9
+EMA_LONG_PERIOD = 21
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
+
+# ============================================================================
+# LIQUIDITY ANALYSIS THRESHOLDS
+# ============================================================================
+
+MIN_ACTIVE_BIN_DEPTH_USD = 1000
 
 # ============================================================================
 # SOLANA PROGRAM IDs (for WebSocket subscriptions)
