@@ -224,6 +224,129 @@ def check_staleness(token_data: Dict[str, Any], token_age_hours: Optional[float]
 
 
 # ============================================================================
+# ENHANCED MOMENTUM ANALYSIS (Technical Signals Integration)
+# ============================================================================
+
+
+def analyze_momentum(
+    token_data: Dict[str, Any],
+    technical_signals: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Perform comprehensive momentum analysis combining basic metrics with technical signals.
+    
+    This is the main entry point for momentum analysis. It combines:
+    - Basic momentum: price velocity, buy/sell ratio, pump phase
+    - Technical signals: RSI, EMA, MACD (if enabled and available)
+    
+    Args:
+        token_data: Token data from DexScreener API response
+        technical_signals: Optional result from technicals.get_technical_signals()
+    
+    Returns:
+        Dict with comprehensive momentum analysis:
+        {
+            "price_velocity": float,
+            "buy_sell_ratio": float or None,
+            "pump_phase": "EARLY" or "LATE",
+            "is_stale": bool,
+            "technical_signals": {...} or None,
+            "enhanced_momentum_score": float (0-100),
+            "signals_summary": str,
+        }
+    """
+    # Basic momentum metrics
+    price_velocity = calculate_price_velocity(token_data)
+    buy_sell_ratio = get_buy_sell_ratio(token_data)
+    pump_phase = classify_pump_phase(token_data)
+    is_stale = check_staleness(token_data)
+    
+    result = {
+        "price_velocity": price_velocity,
+        "buy_sell_ratio": buy_sell_ratio,
+        "pump_phase": pump_phase,
+        "is_stale": is_stale,
+        "technical_signals": technical_signals,
+        "enhanced_momentum_score": 50.0,  # Default neutral
+        "signals_summary": "",
+    }
+    
+    # Calculate enhanced momentum score
+    signals = []
+    
+    # Base score from pump phase
+    base_score = 70 if pump_phase == "EARLY" else 30
+    
+    # Adjust for buy/sell ratio
+    if buy_sell_ratio is not None and buy_sell_ratio != float('inf'):
+        if buy_sell_ratio > 1.5:
+            base_score += 10
+            signals.append("Strong buying pressure")
+        elif buy_sell_ratio < 0.7:
+            base_score -= 15
+            signals.append("Selling pressure")
+    
+    # Integrate technical signals if available
+    if technical_signals is not None:
+        rsi = technical_signals.get("rsi")
+        rsi_oversold = technical_signals.get("rsi_oversold", False)
+        rsi_overbought = technical_signals.get("rsi_overbought", False)
+        ema_bullish = technical_signals.get("ema_bullish", False)
+        macd_bullish = technical_signals.get("macd_bullish", False)
+        trend = technical_signals.get("trend", "neutral")
+        
+        # RSI signal (oversold = bullish for entry, overbought = bearish)
+        if rsi_oversold:
+            base_score += 15
+            signals.append(f"RSI oversold ({rsi:.1f})")
+        elif rsi_overbought:
+            base_score -= 20
+            signals.append(f"RSI overbought ({rsi:.1f})")
+        
+        # EMA cross signal
+        if ema_bullish:
+            base_score += 10
+            signals.append("EMA bullish cross")
+        else:
+            base_score -= 5
+            signals.append("EMA bearish")
+        
+        # MACD signal
+        if macd_bullish:
+            base_score += 10
+            signals.append("MACD bullish")
+        else:
+            base_score -= 5
+            signals.append("MACD bearish")
+        
+        # Trend confirmation bonus
+        if trend == "bullish":
+            base_score += 5
+            signals.append("Trend: bullish")
+        elif trend == "bearish":
+            base_score -= 10
+            signals.append("Trend: bearish")
+    else:
+        signals.append("Technicals: N/A")
+    
+    # Staleness penalty
+    if is_stale:
+        base_score -= 20
+        signals.append("Token is stale")
+    
+    # Clamp to 0-100
+    result["enhanced_momentum_score"] = max(0, min(100, base_score))
+    result["signals_summary"] = "; ".join(signals)
+    
+    logger.debug(
+        f"Enhanced momentum: score={result['enhanced_momentum_score']:.1f}, "
+        f"phase={pump_phase}, signals=[{result['signals_summary']}]"
+    )
+    
+    return result
+
+
+# ============================================================================
 # TESTING & DEBUGGING
 # ============================================================================
 

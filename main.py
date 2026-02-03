@@ -47,10 +47,12 @@ from network_layer import WebSocketManager, TokenEvent
 from polymarket_watcher import fetch_events
 from brain import extract_keywords, analyze_with_llm
 from shield import comprehensive_security_check, _get_token_data_from_dexscreener
-from momentum import classify_pump_phase, check_staleness, calculate_price_velocity, get_buy_sell_ratio
+from momentum import classify_pump_phase, check_staleness, calculate_price_velocity, get_buy_sell_ratio, analyze_momentum
 from scoring import calculate_composite_score, should_alert, format_score_telegram_message
 from state import StateManager
 from dex_hunter import format_usd
+from technicals import get_technical_signals
+from liquidity import analyze_liquidity
 
 # Initialize colorama
 init(autoreset=True)
@@ -282,6 +284,67 @@ async def handle_token_event(event: TokenEvent) -> None:
             return
         
         # =================================================================
+        # TIER 1.5: Technical Signals & Liquidity Analysis (Parallel, Fail-Open)
+        # =================================================================
+        technical_signals = None
+        liquidity_result = None
+        
+        # Get pool address from token_data (for GeckoTerminal/Meteora)
+        pool_address = token_data.get("pairAddress")
+        
+        if pool_address:
+            try:
+                # Run technical signals and liquidity analysis in parallel
+                if config.ENABLE_TECHNICALS or config.ENABLE_LIQUIDITY_ANALYSIS:
+                    logger.info(f"\n[TIER 1.5] Technical & Liquidity Analysis...")
+                    
+                    tasks = []
+                    if config.ENABLE_TECHNICALS:
+                        tasks.append(("technicals", get_technical_signals(pool_address)))
+                    if config.ENABLE_LIQUIDITY_ANALYSIS:
+                        tasks.append(("liquidity", analyze_liquidity(pool_address)))
+                    
+                    if tasks:
+                        # Gather results with fail-open (return_exceptions=True)
+                        results = await asyncio.gather(
+                            *[task[1] for task in tasks],
+                            return_exceptions=True
+                        )
+                        
+                        for i, (name, _) in enumerate(tasks):
+                            result = results[i]
+                            if isinstance(result, Exception):
+                                logger.warning(f"{name} analysis failed (fail-open): {result}")
+                            elif name == "technicals" and isinstance(result, dict):
+                                technical_signals = result
+                            elif name == "liquidity" and isinstance(result, dict):
+                                liquidity_result = result
+                    
+                    # Log technical signals summary
+                    if technical_signals and isinstance(technical_signals, dict):
+                        rsi_val = technical_signals.get('rsi')
+                        logger.info(f"RSI: {rsi_val:.1f}" if rsi_val else "RSI: N/A")
+                        logger.info(f"Trend: {technical_signals.get('trend', 'N/A')}")
+                        logger.info(f"EMA Bullish: {technical_signals.get('ema_bullish', 'N/A')}")
+                        logger.info(f"MACD Bullish: {technical_signals.get('macd_bullish', 'N/A')}")
+                    else:
+                        logger.info("Technical signals: N/A (insufficient data or disabled)")
+                    
+                    # Log liquidity analysis summary
+                    if liquidity_result and isinstance(liquidity_result, dict):
+                        shape = liquidity_result.get("shape")
+                        if shape is not None:
+                            shape_str = shape.value if hasattr(shape, 'value') else str(shape)
+                        else:
+                            shape_str = "Unknown"
+                        logger.info(f"Liquidity Shape: {shape_str}")
+                    else:
+                        logger.info("Liquidity analysis: N/A (not DLMM pool or disabled)")
+            
+            except Exception as e:
+                logger.warning(f"Technical/Liquidity analysis error (fail-open): {e}")
+        
+        # =================================================================
         # TIER 2: Shield Security Check
         # =================================================================
         logger.info(f"\n[TIER 2] Security Analysis...")
@@ -341,16 +404,19 @@ async def handle_token_event(event: TokenEvent) -> None:
         # =================================================================
         logger.info(f"\n[SCORING] Calculating composite score...")
         
-        momentum_result = {
-            "price_velocity": price_velocity,
-            "buy_sell_ratio": buy_sell_ratio if buy_sell_ratio and buy_sell_ratio != float('inf') else 1.0,
-        }
+        # Use enhanced analyze_momentum which integrates technical signals
+        momentum_result = analyze_momentum(token_data, technical_signals)
+        
+        # Ensure buy_sell_ratio is properly set for backward compatibility
+        if momentum_result.get("buy_sell_ratio") == float('inf'):
+            momentum_result["buy_sell_ratio"] = 1.0
         
         score_data = calculate_composite_score(
             shield_result=shield_result,
             momentum_result=momentum_result,
             brain_result=brain_result,
-            pump_phase=pump_phase
+            pump_phase=pump_phase,
+            liquidity_result=liquidity_result,
         )
         
         composite_score = score_data.get("composite_score", 0)
@@ -360,6 +426,8 @@ async def handle_token_event(event: TokenEvent) -> None:
         logger.info(f"Timing: {score_data.get('timing_score')}/100")
         logger.info(f"Momentum: {score_data.get('momentum_score')}/100")
         logger.info(f"Relevance: {score_data.get('relevance_score')}/100")
+        if score_data.get("liquidity_adjustment"):
+            logger.info(f"{score_data.get('liquidity_adjustment')}")
         
         # Check if alert should be sent
         if not should_alert(score_data):

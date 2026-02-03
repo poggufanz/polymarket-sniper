@@ -6,8 +6,9 @@ and LLM analysis into a composite score for alert decision making.
 
 Scoring dimensions:
 - Safety (35%): Shield results (rugcheck, holder concentration, honeypot)
+                + Liquidity shape analysis (SPOT=neutral, CURVE=stable, BID_ASK=risky)
 - Timing (25%): Pump phase classification (EARLY/LATE)
-- Momentum (20%): Price velocity and buy/sell ratio
+- Momentum (20%): Price velocity and buy/sell ratio + technical indicators
 - Relevance (20%): LLM relevance and authenticity analysis
 """
 
@@ -19,11 +20,68 @@ import config
 logger = logging.getLogger(__name__)
 
 
+# =============================================================================
+# LIQUIDITY SHAPE SCORE ADJUSTMENT
+# =============================================================================
+
+def _adjust_safety_for_liquidity_shape(
+    base_safety_score: float,
+    liquidity_result: Optional[Dict[str, Any]]
+) -> tuple[float, str]:
+    """
+    Adjust safety score based on liquidity shape analysis.
+    
+    Scoring adjustments based on system_prompt.md Section 2.2:
+    - SPOT: Neutral (no adjustment) - uniform distribution
+    - CURVE: Stable (+5) - concentrated around active bin, mean reversion
+    - BID_ASK: Risky (-15) - heavy at edges, expecting volatility
+    
+    Args:
+        base_safety_score: The initial safety score from Shield
+        liquidity_result: Result from liquidity.analyze_liquidity() or None
+        
+    Returns:
+        Tuple of (adjusted_score, reason_string)
+    """
+    if liquidity_result is None:
+        return base_safety_score, "Liquidity analysis: N/A"
+    
+    shape = liquidity_result.get("shape")
+    if shape is None:
+        return base_safety_score, "Liquidity shape: Unknown"
+    
+    # Import here to avoid circular dependency
+    try:
+        from liquidity import LiquidityShape
+        
+        if isinstance(shape, LiquidityShape):
+            shape_value = shape.value
+        else:
+            shape_value = str(shape)
+    except ImportError:
+        shape_value = str(shape)
+    
+    if shape_value == "SPOT":
+        # Neutral - no adjustment
+        return base_safety_score, "Liquidity shape: SPOT (neutral)"
+    elif shape_value == "CURVE":
+        # Stable - slight positive
+        adjusted = base_safety_score + 5
+        return min(100, adjusted), "Liquidity shape: CURVE (stable, +5)"
+    elif shape_value == "BID_ASK":
+        # Risky - negative adjustment
+        adjusted = base_safety_score - 15
+        return max(0, adjusted), "Liquidity shape: BID_ASK (volatile, -15)"
+    else:
+        return base_safety_score, f"Liquidity shape: {shape_value}"
+
+
 def calculate_composite_score(
     shield_result: Dict[str, Any],
     momentum_result: Dict[str, Any],
     brain_result: Dict[str, Any],
-    pump_phase: str
+    pump_phase: str,
+    liquidity_result: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Calculate composite multi-dimensional score.
@@ -33,9 +91,12 @@ def calculate_composite_score(
                       Must contain: safety_score (0-100)
         momentum_result: From momentum module
                         Must contain: price_velocity (float), buy_sell_ratio (float)
+                        Optional: enhanced_momentum_score (float) from analyze_momentum()
         brain_result: From brain.analyze_with_llm()
                      Must contain: relevance_score (0-100), confidence (0-100)
         pump_phase: "EARLY" or "LATE" from momentum.classify_pump_phase()
+        liquidity_result: Optional result from liquidity.analyze_liquidity()
+                         Used to adjust safety score based on liquidity shape.
     
     Returns:
         Dict with composite score and breakdown:
@@ -52,6 +113,7 @@ def calculate_composite_score(
                 "relevance": ...
             },
             "weights": config.SCORE_WEIGHTS,
+            "liquidity_adjustment": str,
             "timestamp": ISO8601 string
         }
     """
@@ -60,31 +122,40 @@ def calculate_composite_score(
     # Extract individual scores from results
     safety_score = shield_result.get("safety_score", 0)
     
+    # Adjust safety score for liquidity shape
+    safety_score, liquidity_adjustment = _adjust_safety_for_liquidity_shape(
+        safety_score, liquidity_result
+    )
+    
     # Timing score: EARLY phase = good (80), LATE phase = bad (20)
     timing_score = 80 if pump_phase == "EARLY" else 20
     
-    # Momentum score: based on price velocity and buy/sell ratio
-    # Normalize price velocity (0-50% = 20-80 score, >50% = 20 score)
-    price_velocity = momentum_result.get("price_velocity", 0)
-    if price_velocity < 0:
-        momentum_from_velocity = 50  # Negative is neutral (decline but no rug)
-    elif price_velocity < config.MAX_1H_PRICE_CHANGE_PERCENT:
-        # Scale linearly: 0% = 20, 50% = 80
-        momentum_from_velocity = 20 + (price_velocity / config.MAX_1H_PRICE_CHANGE_PERCENT) * 60
+    # Momentum score: use enhanced score if available, otherwise calculate from basics
+    if "enhanced_momentum_score" in momentum_result and momentum_result["enhanced_momentum_score"] is not None:
+        momentum_score = momentum_result["enhanced_momentum_score"]
     else:
-        momentum_from_velocity = 20  # Over 50% = weak momentum signal
-    
-    # Buy/sell ratio factor (1.0 = balanced, higher = more bullish)
-    ratio = momentum_result.get("buy_sell_ratio", 1.0)
-    if ratio is None:
-        ratio_score = 50
-    elif ratio < 1.0:
-        ratio_score = 20 + (ratio * 80)  # 0.0 = 20, 1.0 = 100
-    else:
-        ratio_score = min(80 + (ratio - 1.0) * 20, 100)  # 1.0 = 80, 2.0 = 100
-    
-    # Average the two momentum factors
-    momentum_score = (momentum_from_velocity + ratio_score) / 2
+        # Fallback: calculate from price velocity and buy/sell ratio
+        # Normalize price velocity (0-50% = 20-80 score, >50% = 20 score)
+        price_velocity = momentum_result.get("price_velocity", 0)
+        if price_velocity < 0:
+            momentum_from_velocity = 50  # Negative is neutral (decline but no rug)
+        elif price_velocity < config.MAX_1H_PRICE_CHANGE_PERCENT:
+            # Scale linearly: 0% = 20, 50% = 80
+            momentum_from_velocity = 20 + (price_velocity / config.MAX_1H_PRICE_CHANGE_PERCENT) * 60
+        else:
+            momentum_from_velocity = 20  # Over 50% = weak momentum signal
+        
+        # Buy/sell ratio factor (1.0 = balanced, higher = more bullish)
+        ratio = momentum_result.get("buy_sell_ratio", 1.0)
+        if ratio is None:
+            ratio_score = 50
+        elif ratio < 1.0:
+            ratio_score = 20 + (ratio * 80)  # 0.0 = 20, 1.0 = 100
+        else:
+            ratio_score = min(80 + (ratio - 1.0) * 20, 100)  # 1.0 = 80, 2.0 = 100
+        
+        # Average the two momentum factors
+        momentum_score = (momentum_from_velocity + ratio_score) / 2
     
     # Relevance score: from LLM analysis
     relevance_score = brain_result.get("relevance_score", 50)
@@ -124,6 +195,7 @@ def calculate_composite_score(
             "relevance": round(relevance_score, 1),
         },
         "weights": config.SCORE_WEIGHTS,
+        "liquidity_adjustment": liquidity_adjustment,
         "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
     }
 
