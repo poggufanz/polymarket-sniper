@@ -18,6 +18,12 @@ PM-Predict is an async event-driven bot that monitors Solana WebSocket feeds for
 - **Composite Scoring**: 4-dimensional score (Safety 35%, Timing 25%, Momentum 20%, Relevance 20%)
 - **Alert Rate Limiting**: Maximum 3 high-quality alerts per day
 - **Duplicate Prevention**: Tracks tokens alerted on, prevents same-day re-alerts
+- **Advanced Memecoin Validation**:
+  - **Clone Detection**: Fuzzy name matching + first mover timestamp check (WARNING on detection)
+  - **News Validation**: Google News RSS real-time narrative verification
+  - **Social Presence Check**: Verification of Twitter, Telegram, Discord, and website presence
+  - **GoPlus Security**: 20+ advanced contract security checks (honeypot detection, mintability, blacklist)
+  - **Entry Signal Watcher**: Tracks new 5-minute tokens and alerts on 50% price dips for entry opportunities
 
 ---
 
@@ -30,9 +36,15 @@ Polymarket Events → Keywords → WebSocket Filter → Token Event
   → Tier 1: Momentum check (EARLY/LATE, staleness)
   → Tier 2: Shield security check (multi-factor validation)
   → Tier 3: Brain LLM analysis (gatekept - only if tiers 1-2 pass)
+  → Tier 6: Clone Detection (fuzzy match + timestamp analysis)
+  → Tier 7: Social Presence Check (Twitter, Telegram, Discord, website)
+  → Tier 8: News Validation (Google News RSS real-time narrative check)
+  → Tier 9: GoPlus Security (20+ advanced blockchain checks)
   → Scoring: Composite score calculation
   → Alert: State limiting + Telegram notification
 ```
+
+**Note**: Entry Signal Watcher runs in separate watch mode for newly detected tokens with configurable drop thresholds.
 
 ---
 
