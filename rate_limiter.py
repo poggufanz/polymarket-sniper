@@ -8,6 +8,7 @@ Supported rate limits:
 - DexScreener: 30 requests per minute (rpm)
 - RugCheck: 10 requests per minute (rpm)
 - Gemini: 60 requests per minute (rpm)
+- GeckoTerminal: 30 requests per minute (rpm)
 """
 
 import time
@@ -59,6 +60,7 @@ class RateLimiter:
 _dexscreener_limiter = RateLimiter(30)  # 30 rpm
 _rugcheck_limiter = RateLimiter(10)     # 10 rpm
 _gemini_limiter = RateLimiter(60)       # 60 rpm
+_geckoterminal_limiter = RateLimiter(30)  # 30 rpm
 
 
 def rate_limit_dexscreener(func: Callable) -> Callable:
@@ -108,6 +110,23 @@ def rate_limit_gemini(func: Callable) -> Callable:
     @wraps(func)
     def wrapper(*args, **kwargs) -> Any:
         _gemini_limiter.wait_if_needed()
+        return func(*args, **kwargs)
+    return wrapper
+
+
+def rate_limit_geckoterminal(func: Callable) -> Callable:
+    """
+    Decorator to rate-limit GeckoTerminal API calls (30 rpm).
+    
+    Usage:
+        @rate_limit_geckoterminal
+        async def fetch_ohlcv(pool_address):
+            # API call here
+            pass
+    """
+    @wraps(func)
+    def wrapper(*args, **kwargs) -> Any:
+        _geckoterminal_limiter.wait_if_needed()
         return func(*args, **kwargs)
     return wrapper
 
