@@ -9,6 +9,7 @@ Also provides LLM-powered token analysis using Gemini.
 
 import re
 import time
+import json
 import logging
 from pathlib import Path
 from typing import List, Set, Dict, Any, Optional
@@ -158,7 +159,6 @@ def analyze_with_llm(token_data: Dict[str, Any], event_title: str) -> Dict[str, 
             logger.warning("Empty response from Gemini API")
             return NEUTRAL_RESULT.copy()
         
-        import json
         result = json.loads(response.text)
         
         # Validate and sanitize the result

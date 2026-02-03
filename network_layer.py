@@ -20,7 +20,7 @@ import asyncio
 import json
 import logging
 import base64
-from typing import Callable, Optional, Set, Any
+from typing import Callable, Optional, Set, Any, Union
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -83,7 +83,7 @@ class WebSocketManager:
     def __init__(self):
         """Initialize WebSocket manager with default settings."""
         self._active_narratives: Set[str] = set()
-        self._websocket: Optional[websockets.WebSocketClientProtocol] = None
+        self._websocket: Any = None
         self._running: bool = False
         self._reconnect_delay: float = INITIAL_RECONNECT_DELAY
         self._subscription_ids: dict = {}
@@ -235,6 +235,9 @@ class WebSocketManager:
         Returns:
             Subscription ID for later unsubscription.
         """
+        if not self._websocket:
+            raise RuntimeError("WebSocket not connected")
+            
         request = {
             "jsonrpc": "2.0",
             "id": 1,
@@ -260,6 +263,10 @@ class WebSocketManager:
     
     async def _unsubscribe(self, subscription_id: int) -> None:
         """Unsubscribe from a log subscription."""
+        if not self._websocket:
+            logger.debug("WebSocket not connected, skipping unsubscribe")
+            return
+            
         request = {
             "jsonrpc": "2.0",
             "id": 1,
@@ -268,7 +275,7 @@ class WebSocketManager:
         }
         await self._websocket.send(json.dumps(request))
     
-    async def _process_message(self, message: str) -> None:
+    async def _process_message(self, message: Union[str, bytes]) -> None:
         """
         Process incoming WebSocket message.
         
@@ -276,11 +283,14 @@ class WebSocketManager:
         and invokes callback if match found.
         
         Args:
-            message: Raw JSON message from WebSocket.
+            message: Raw JSON message from WebSocket (str or bytes).
         """
         try:
+            # Convert bytes to str if needed
+            if isinstance(message, bytes):
+                message = message.decode('utf-8')
             data = json.loads(message)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):
             logger.warning(f"Invalid JSON message received")
             return
         
