@@ -198,6 +198,99 @@ def _clamp(value: Any, min_val: int, max_val: int) -> int:
 
 
 # ==============================================================================
+# NARRATIVE EXTRACTION WITH LLM
+# ==============================================================================
+
+# Load narrative extraction prompt template
+_NARRATIVE_PROMPT_TEMPLATE: Optional[str] = None
+
+
+def _get_narrative_prompt_template() -> str:
+    """Load the narrative extraction prompt template from file (cached after first load)."""
+    global _NARRATIVE_PROMPT_TEMPLATE
+    if _NARRATIVE_PROMPT_TEMPLATE is None:
+        prompt_path = Path(__file__).parent / "prompts" / "narrative_extraction.txt"
+        try:
+            _NARRATIVE_PROMPT_TEMPLATE = prompt_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            logger.error(f"Narrative prompt template not found: {prompt_path}")
+            _NARRATIVE_PROMPT_TEMPLATE = ""
+    return _NARRATIVE_PROMPT_TEMPLATE
+
+
+@rate_limit_gemini
+def extract_concepts_with_llm(event_title: str) -> Optional[List[str]]:
+    """
+    Extract meme-worthy keywords from an event title using LLM.
+    
+    Uses the "Smart Money" prompt to identify contextual hooks and unique
+    objects that degens might mint tokens for.
+    
+    Args:
+        event_title: The Polymarket event title.
+        
+    Returns:
+        List of 3-5 keywords in UPPERCASE, or None on failure.
+    """
+    # Validate API key
+    if not GEMINI_API_KEY:
+        logger.debug("GEMINI_API_KEY not configured, skipping LLM extraction")
+        return None
+    
+    # Load prompt template
+    prompt_template = _get_narrative_prompt_template()
+    if not prompt_template:
+        logger.debug("Narrative prompt template not available, skipping LLM extraction")
+        return None
+    
+    # Build the prompt
+    prompt = prompt_template.format(event_title=event_title)
+    
+    try:
+        # Initialize Gemini client
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        
+        # Generate with JSON output mode
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.3,  # Lower temperature for consistent extraction
+            ),
+        )
+        
+        # Parse response
+        if not response.text:
+            logger.warning("Empty response from Gemini API for narrative extraction")
+            return None
+        
+        result = json.loads(response.text)
+        
+        # Validate result is a list of strings
+        if not isinstance(result, list):
+            logger.warning(f"Unexpected LLM response format: {type(result)}")
+            return None
+        
+        # Ensure all items are uppercase strings
+        keywords = [str(kw).upper() for kw in result if isinstance(kw, str)]
+        
+        if not keywords:
+            logger.warning("LLM returned empty keywords list")
+            return None
+        
+        logger.info(f"LLM extracted keywords for '{event_title[:50]}...': {keywords}")
+        return keywords[:5]  # Limit to 5 keywords
+        
+    except json.JSONDecodeError as e:
+        logger.warning(f"Failed to parse LLM response as JSON: {e}")
+        return None
+    except Exception as e:
+        logger.warning(f"LLM extraction error: {e}")
+        return None
+
+
+# ==============================================================================
 # KEYWORD EXTRACTION
 # ==============================================================================
 
@@ -230,6 +323,10 @@ STOP_WORDS: Set[str] = {
     "get", "gets", "become", "becomes", "announce", "announced",
     # Filler words
     "this", "that", "these", "those", "here", "there",
+    # Additional stopwords for narrative filtering
+    "new", "open", "pro", "men", "things", "decision", "acquire", "chair",
+    "nominee", "outcome", "will", "does", "reach", "record", "report",
+    "confirm", "official", "update", "breaking",
 }
 
 # High-value keywords to always prioritize (politics, tech, scandals)
@@ -326,17 +423,19 @@ def extract_keywords(title: str) -> List[str]:
     Extract meme coin relevant keywords from a Polymarket event title.
     
     Strategy:
-    1. Clean and normalize the title
-    2. Remove dates and stop words
-    3. Prioritize known high-value keywords
-    4. Focus on proper nouns (capitalized words)
-    5. Return top 3 most relevant keywords in UPPERCASE
+    1. Try LLM extraction first (Smart Money narrative hunter)
+    2. Fallback to regex-based extraction if LLM fails
+    3. Clean and normalize the title
+    4. Remove dates and stop words
+    5. Prioritize known high-value keywords
+    6. Focus on proper nouns (capitalized words)
+    7. Return top 3-5 most relevant keywords in UPPERCASE
     
     Args:
         title: The Polymarket event title.
         
     Returns:
-        List of up to 3 keywords in UPPERCASE.
+        List of up to 5 keywords in UPPERCASE.
     """
     original_title = title
     title_lower = title.lower()
@@ -345,6 +444,15 @@ def extract_keywords(title: str) -> List[str]:
     for banned in BLACKLIST:
         if banned in title_lower:
             return []  # Skip this event entirely
+    
+    # Try LLM extraction first (Smart Money narrative hunter)
+    llm_keywords = extract_concepts_with_llm(original_title)
+    if llm_keywords:
+        logger.debug(f"Using LLM-extracted keywords: {llm_keywords}")
+        return llm_keywords[:5]
+    
+    # Fallback to regex-based extraction
+    logger.debug(f"Falling back to regex extraction for: {original_title[:50]}...")
     
     # Step 1: Remove dates first
     title = remove_dates(title)
