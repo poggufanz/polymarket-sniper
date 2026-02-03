@@ -15,10 +15,17 @@ import os
 MAX_1H_PRICE_CHANGE_PERCENT = 50  # >50% pump in 1h = late entry, filter out
 MIN_1H_PRICE_CHANGE_PERCENT = 0.1  # Minimum discernible price movement
 
+# Clone similarity and entry thresholds
+CLONE_SIMILARITY_THRESHOLD = 75  # Similarity score threshold for clone detection
+
 # Holder concentration analysis
 MAX_TOP10_HOLDER_PERCENT = 50  # >50% in top 10 holders = danger signal
 MIN_HOLDER_COUNT = 100  # Tokens with <100 holders = high risk
 MAX_TOP_HOLDER_PERCENT = 30  # Single holder >30% = extreme concentration risk
+
+# Entry point analysis
+ENTRY_DROP_THRESHOLD_PERCENT = 50  # Threshold for entry point drops
+ENTRY_WATCH_DURATION_MINUTES = 60  # Duration to watch entry points
 
 # Liquidity requirements
 MIN_LIQUIDITY_USD = 5000  # Minimum pool liquidity to consider
@@ -58,6 +65,8 @@ RUGCHECK_RPM = 10  # RugCheck: Conservative limit
 SOLANA_RPC_RPM = 20  # Solana RPC: Conservative for shared endpoints
 GECKOTERMINAL_RPM = 30  # GeckoTerminal free tier (no API key needed)
 METEORA_RPM = 30  # Meteora DLMM API
+GOOGLE_NEWS_RPM = 2  # Google News RSS feed rate limit
+GOPLUS_RPM = 30  # GoPlusLabs API rate limit
 
 # ============================================================================
 # SOLANA RPC ENDPOINTS
@@ -82,6 +91,13 @@ GECKOTERMINAL_API_URL = "https://api.geckoterminal.com/api/v2"
 
 # Meteora DLMM
 METEORA_API_URL = "https://dlmm-api.meteora.ag"
+
+# Google News RSS Feed
+GOOGLE_NEWS_RSS_URL_TEMPLATE = "https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
+GOOGLE_NEWS_CACHE_TTL_SECONDS = 1800
+
+# GoPlusLabs Security API
+GOPLUS_API_URL = "https://api.gopluslabs.io/api/v1/token_security/solana"
 
 # ============================================================================
 # API KEYS (from environment variables)
