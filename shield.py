@@ -21,6 +21,13 @@ from rate_limiter import rate_limit_rugcheck, rate_limit, rate_limit_dexscreener
 import config
 from state import StateManager
 
+# New module imports for Tiers 6-9
+from clone_detector import check_clone_token
+from social_checker import check_social_presence
+from news_validator import validate_news
+import goplus_security
+import asyncio
+
 # Initialize colorama
 init(autoreset=True)
 
@@ -964,6 +971,9 @@ def check_cabal_topology(
 def comprehensive_security_check(
     mint_address: str,
     token_data: Optional[Dict] = None,
+    symbol: Optional[str] = None,
+    name: Optional[str] = None,
+    matched_narrative: Optional[str] = None,
     verbose: bool = True
 ) -> Dict[str, Any]:
     """
@@ -975,10 +985,17 @@ def comprehensive_security_check(
     3. Honeypot detection (DexScreener txns)
     4. Bundled transaction detection (heuristic)
     5. Cabal topology detection (star pattern funding)
+    6. Clone detection (fuzzy name matching via DexScreener)
+    7. Social presence check (Twitter, Telegram, Discord, Website)
+    8. News validation (Google News RSS feed)
+    9. GoPlus security check (honeypot, mintable, hidden owner)
     
     Args:
         mint_address: The token's mint address.
         token_data: Pre-fetched DexScreener data (optional, will fetch if needed).
+        symbol: Token symbol (e.g., "TRUMP") for clone detection.
+        name: Token full name (e.g., "Trump Victory Token") for clone detection.
+        matched_narrative: Narrative from Polymarket for news validation.
         verbose: If True, print status messages.
         
     Returns:
@@ -991,6 +1008,10 @@ def comprehensive_security_check(
         - honeypot: Result from check_honeypot
         - bundled_tx: Result from check_bundled_transactions
         - cabal_topology: Result from check_cabal_topology
+        - clone_detection: Result from check_clone_token
+        - social_presence: Result from check_social_presence
+        - news_validation: Result from validate_news
+        - goplus_security: Result from check_goplus_security
         - danger_flags: List of danger-level issues
         - warning_flags: List of warning-level issues
     """
@@ -1009,6 +1030,10 @@ def comprehensive_security_check(
         "honeypot": {},
         "bundled_tx": {},
         "cabal_topology": {},
+        "clone_detection": {},
+        "social_presence": {},
+        "news_validation": {},
+        "goplus_security": {},
         "danger_flags": [],
         "warning_flags": []
     }
@@ -1024,7 +1049,7 @@ def comprehensive_security_check(
     
     # Tier 1: RugCheck basic check
     if verbose:
-        print(f"\n{Fore.WHITE}[1/5] RugCheck Security Scan{Style.RESET_ALL}")
+        print(f"\n{Fore.WHITE}[1/9] RugCheck Security Scan{Style.RESET_ALL}")
     is_safe_rc, reason_rc = check_security(mint_address, verbose=verbose)
     results["rugcheck"] = {"is_safe": is_safe_rc, "reason": reason_rc}
     
@@ -1034,7 +1059,7 @@ def comprehensive_security_check(
     
     # Tier 2: Holder concentration check
     if verbose:
-        print(f"\n{Fore.WHITE}[2/5] Holder Concentration Analysis{Style.RESET_ALL}")
+        print(f"\n{Fore.WHITE}[2/9] Holder Concentration Analysis{Style.RESET_ALL}")
     
     # Get holders via RPC first to capture addresses for cabal check
     rpc_holders = _get_holders_from_rpc(mint_address, verbose=verbose)
@@ -1053,7 +1078,7 @@ def comprehensive_security_check(
     
     # Tier 3: Honeypot detection
     if verbose:
-        print(f"\n{Fore.WHITE}[3/5] Honeypot Detection{Style.RESET_ALL}")
+        print(f"\n{Fore.WHITE}[3/9] Honeypot Detection{Style.RESET_ALL}")
     honeypot_result = check_honeypot(token_data=token_data, verbose=verbose)
     results["honeypot"] = honeypot_result
     
@@ -1066,7 +1091,7 @@ def comprehensive_security_check(
     
     # Tier 4: Bundled transaction detection
     if verbose:
-        print(f"\n{Fore.WHITE}[4/5] Bundled Transaction Check{Style.RESET_ALL}")
+        print(f"\n{Fore.WHITE}[4/9] Bundled Transaction Check{Style.RESET_ALL}")
     bundled_result = check_bundled_transactions(token_data=token_data, verbose=verbose)
     results["bundled_tx"] = bundled_result
     
@@ -1083,7 +1108,7 @@ def comprehensive_security_check(
     if config.ENABLE_CABAL_TRACING and config.ENABLE_CABAL_CACHING and StateManager.was_cabal_traced(mint_address):
         cabal_cached = True
         if verbose:
-            print(f"\n{Fore.WHITE}[5/5] Cabal Topology Detection: CACHED (previously traced){Style.RESET_ALL}")
+            print(f"\n{Fore.WHITE}[5/9] Cabal Topology Detection: CACHED (previously traced){Style.RESET_ALL}")
         results["cabal_topology"] = {
             "is_cabal": False,  # Safe default for cached tokens
             "level": LEVEL_OK,
@@ -1092,7 +1117,7 @@ def comprehensive_security_check(
         }
     elif config.ENABLE_CABAL_TRACING and holder_addresses:
         if verbose:
-            print(f"\n{Fore.WHITE}[5/5] Cabal Topology Detection{Style.RESET_ALL}")
+            print(f"\n{Fore.WHITE}[5/9] Cabal Topology Detection{Style.RESET_ALL}")
         
         cabal_result = check_cabal_topology(holder_addresses, verbose=verbose)
         results["cabal_topology"] = cabal_result
@@ -1110,14 +1135,124 @@ def comprehensive_security_check(
     else:
         # Cabal check skipped
         if verbose and not config.ENABLE_CABAL_TRACING:
-            print(f"\n{Fore.WHITE}[5/5] Cabal Detection: SKIPPED (disabled){Style.RESET_ALL}")
+            print(f"\n{Fore.WHITE}[5/9] Cabal Detection: SKIPPED (disabled){Style.RESET_ALL}")
         elif verbose and not holder_addresses:
-            print(f"\n{Fore.WHITE}[5/5] Cabal Detection: SKIPPED (no holder addresses){Style.RESET_ALL}")
+            print(f"\n{Fore.WHITE}[5/9] Cabal Detection: SKIPPED (no holder addresses){Style.RESET_ALL}")
         results["cabal_topology"] = {
             "is_cabal": False,
             "level": LEVEL_UNKNOWN,
             "common_funders": [],
             "reason": "Cabal check skipped"
+        }
+    
+    # Tier 6: Clone Detection
+    if symbol and name:
+        if verbose:
+            print(f"\n{Fore.WHITE}[6/9] Clone Detection{Style.RESET_ALL}")
+        clone_result = check_clone_token(
+            symbol=symbol,
+            name=name,
+            mint_address=mint_address,
+            verbose=verbose
+        )
+        results["clone_detection"] = clone_result
+        
+        if clone_result["level"] == LEVEL_DANGER:
+            results["danger_flags"].append(f"Clone: {clone_result['reason']}")
+            results["safety_score"] -= 20
+        elif clone_result["level"] == LEVEL_WARNING:
+            results["warning_flags"].append(clone_result["reason"])
+            results["safety_score"] -= 10
+    else:
+        if verbose:
+            print(f"\n{Fore.WHITE}[6/9] Clone Detection: SKIPPED (no symbol/name){Style.RESET_ALL}")
+        results["clone_detection"] = {
+            "level": LEVEL_UNKNOWN,
+            "reason": "Clone check skipped - no symbol/name provided",
+            "is_clone": False,
+            "clone_of": None,
+            "similarity_score": 0,
+            "matches": []
+        }
+    
+    # Tier 7: Social Presence Check
+    if token_data:
+        if verbose:
+            print(f"\n{Fore.WHITE}[7/9] Social Presence Check{Style.RESET_ALL}")
+        social_result = check_social_presence(token_data=token_data, verbose=verbose)
+        results["social_presence"] = social_result
+        
+        if social_result["level"] == LEVEL_DANGER:
+            results["danger_flags"].append(f"Social: {social_result['reason']}")
+            results["safety_score"] -= 20
+        elif social_result["level"] == LEVEL_WARNING:
+            results["warning_flags"].append(social_result["reason"])
+            results["safety_score"] -= 10
+    else:
+        if verbose:
+            print(f"\n{Fore.WHITE}[7/9] Social Presence: SKIPPED (no token data){Style.RESET_ALL}")
+        results["social_presence"] = {
+            "level": LEVEL_UNKNOWN,
+            "reason": "Social check skipped - no token data",
+            "has_twitter": False,
+            "has_telegram": False,
+            "has_discord": False,
+            "has_website": False,
+            "social_count": 0
+        }
+    
+    # Tier 8: News Validation
+    # Build query from symbol/name, use matched_narrative for better results
+    news_query = name or symbol or ""
+    if news_query:
+        if verbose:
+            print(f"\n{Fore.WHITE}[8/9] News Validation{Style.RESET_ALL}")
+        news_result = validate_news(
+            query=news_query,
+            token_name=name,
+            matched_narrative=matched_narrative,
+            verbose=verbose
+        )
+        results["news_validation"] = news_result
+        
+        if news_result["level"] == LEVEL_DANGER:
+            results["danger_flags"].append(f"News: {news_result['reason']}")
+            results["safety_score"] -= 20
+        elif news_result["level"] == LEVEL_WARNING:
+            results["warning_flags"].append(news_result["reason"])
+            results["safety_score"] -= 10
+    else:
+        if verbose:
+            print(f"\n{Fore.WHITE}[8/9] News Validation: SKIPPED (no query){Style.RESET_ALL}")
+        results["news_validation"] = {
+            "level": LEVEL_UNKNOWN,
+            "reason": "News check skipped - no query available",
+            "has_news": False,
+            "article_count": 0,
+            "articles": []
+        }
+    
+    # Tier 9: GoPlus Security Check
+    if verbose:
+        print(f"\n{Fore.WHITE}[9/9] GoPlus Security Check{Style.RESET_ALL}")
+    try:
+        # GoPlus check is async, run it synchronously
+        goplus_result = asyncio.run(goplus_security.check_goplus_security(mint_address))
+        results["goplus_security"] = goplus_result
+        
+        if goplus_result["level"] == LEVEL_DANGER:
+            results["danger_flags"].append(f"GoPlus: {goplus_result['reason']}")
+            results["safety_score"] -= 20
+        elif goplus_result["level"] == LEVEL_WARNING:
+            results["warning_flags"].append(goplus_result["reason"])
+            results["safety_score"] -= 10
+    except Exception as e:
+        if verbose:
+            print(f"  {Fore.YELLOW}⚠️  GoPlus check failed: {e}{Style.RESET_ALL}")
+        results["goplus_security"] = {
+            "level": LEVEL_UNKNOWN,
+            "reason": f"GoPlus check failed: {str(e)[:50]}",
+            "checks": {}
         }
     
     # Calculate overall level
