@@ -626,6 +626,337 @@ def check_bundled_transactions(
 
 
 # =============================================================================
+# DEEP CABAL TRACING (Star Topology Detection)
+# =============================================================================
+
+def _fetch_transactions_helius(wallet_address: str, limit: int = 100, verbose: bool = False) -> Optional[List[Dict]]:
+    """
+    Fetch transaction history using Helius enhanced API (preferred method).
+    
+    Args:
+        wallet_address: The wallet address to trace.
+        limit: Maximum transactions to fetch (default 100).
+        verbose: If True, print status messages.
+        
+    Returns:
+        List of parsed transactions, or None on failure.
+    """
+    if not config.HELIUS_API_KEY:
+        return None
+    
+    try:
+        url = f"https://api.helius.xyz/v0/addresses/{wallet_address}/transactions"
+        params = {
+            "api-key": config.HELIUS_API_KEY,
+            "limit": min(limit, 100)
+        }
+        
+        response = requests.get(url, params=params, timeout=config.CABAL_TRACE_TIMEOUT_SECONDS)
+        response.raise_for_status()
+        
+        transactions = response.json()
+        if verbose and transactions:
+            print(f"  {Fore.WHITE}📜 Helius returned {len(transactions)} transactions{Style.RESET_ALL}")
+        
+        return transactions
+        
+    except requests.exceptions.Timeout:
+        if verbose:
+            print(f"  {Fore.YELLOW}⏱️  Helius API timeout{Style.RESET_ALL}")
+        return None
+    except requests.exceptions.RequestException as e:
+        if verbose:
+            print(f"  {Fore.YELLOW}⚠️  Helius API error: {e}{Style.RESET_ALL}")
+        return None
+    except Exception as e:
+        if verbose:
+            print(f"  {Fore.YELLOW}⚠️  Helius unexpected error: {e}{Style.RESET_ALL}")
+        return None
+
+
+def _fetch_signatures_rpc(wallet_address: str, limit: int = 100, verbose: bool = False) -> Optional[List[Dict]]:
+    """
+    Fetch transaction signatures using Solana RPC (fallback method).
+    
+    Args:
+        wallet_address: The wallet address to trace.
+        limit: Maximum signatures to fetch.
+        verbose: If True, print status messages.
+        
+    Returns:
+        List of signature objects, or None on failure.
+    """
+    try:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [
+                wallet_address,
+                {"limit": min(limit, 1000)}
+            ]
+        }
+        
+        response = requests.post(
+            config.SOLANA_RPC_URL,
+            json=payload,
+            timeout=config.CABAL_TRACE_TIMEOUT_SECONDS
+        )
+        response.raise_for_status()
+        data = response.json()
+        
+        if "error" in data:
+            if verbose:
+                print(f"  {Fore.YELLOW}⚠️  RPC error: {data['error'].get('message', 'Unknown')}{Style.RESET_ALL}")
+            return None
+        
+        signatures = data.get("result", [])
+        if verbose and signatures:
+            print(f"  {Fore.WHITE}📜 RPC returned {len(signatures)} signatures{Style.RESET_ALL}")
+        
+        return signatures
+        
+    except requests.exceptions.Timeout:
+        if verbose:
+            print(f"  {Fore.YELLOW}⏱️  RPC timeout for signatures{Style.RESET_ALL}")
+        return None
+    except Exception as e:
+        if verbose:
+            print(f"  {Fore.YELLOW}⚠️  RPC error: {e}{Style.RESET_ALL}")
+        return None
+
+
+def _fetch_transaction_rpc(signature: str, verbose: bool = False) -> Optional[Dict]:
+    """
+    Fetch single transaction details using Solana RPC.
+    
+    Args:
+        signature: Transaction signature.
+        verbose: If True, print status messages.
+        
+    Returns:
+        Transaction data, or None on failure.
+    """
+    try:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTransaction",
+            "params": [
+                signature,
+                {"encoding": "json", "maxSupportedTransactionVersion": 0}
+            ]
+        }
+        
+        response = requests.post(
+            config.SOLANA_RPC_URL,
+            json=payload,
+            timeout=config.CABAL_TRACE_TIMEOUT_SECONDS
+        )
+        response.raise_for_status()
+        return response.json()
+        
+    except Exception as e:
+        if verbose:
+            print(f"  {Fore.YELLOW}⚠️  Transaction fetch error: {e}{Style.RESET_ALL}")
+        return None
+
+
+def _get_funding_source(wallet_address: str, use_helius: bool = True, verbose: bool = False) -> Optional[str]:
+    """
+    Get the funding source (first SOL sender) for a wallet.
+    
+    Traces wallet history to find the address that first funded it with SOL.
+    Uses Helius API when available, falls back to sequential RPC calls.
+    
+    Args:
+        wallet_address: The wallet to trace.
+        use_helius: If True, try Helius API first.
+        verbose: If True, print status messages.
+        
+    Returns:
+        Funding source address, or None if not determinable.
+    """
+    try:
+        # Try Helius first (more efficient)
+        if use_helius and config.HELIUS_API_KEY:
+            transactions = _fetch_transactions_helius(wallet_address, limit=100, verbose=verbose)
+            
+            if transactions:
+                # Look for incoming SOL transfers (nativeTransfers)
+                for tx in reversed(transactions):  # Start from oldest
+                    native_transfers = tx.get("nativeTransfers", [])
+                    for transfer in native_transfers:
+                        to_account = transfer.get("toUserAccount", "")
+                        from_account = transfer.get("fromUserAccount", "")
+                        amount = transfer.get("amount", 0)
+                        
+                        # Found incoming SOL transfer to our wallet
+                        if to_account == wallet_address and from_account and amount > 0:
+                            if verbose:
+                                print(f"  {Fore.WHITE}💰 Funder: {from_account[:20]}...{Style.RESET_ALL}")
+                            return from_account
+                
+                # Check feePayer as fallback (might be the funder)
+                if transactions:
+                    oldest_tx = transactions[-1] if transactions else None
+                    if oldest_tx:
+                        fee_payer = oldest_tx.get("feePayer")
+                        if fee_payer and fee_payer != wallet_address:
+                            return fee_payer
+                
+                return None
+        
+        # Fallback: Sequential RPC (slower)
+        signatures = _fetch_signatures_rpc(wallet_address, limit=100, verbose=verbose)
+        
+        if not signatures:
+            return None
+        
+        # Get oldest transaction (last in list as they're newest-first)
+        for sig_info in reversed(signatures):
+            sig = sig_info.get("signature")
+            if not sig:
+                continue
+            
+            tx_data = _fetch_transaction_rpc(sig, verbose=verbose)
+            if not tx_data or "result" not in tx_data:
+                continue
+            
+            result = tx_data["result"]
+            if not result:
+                continue
+            
+            meta = result.get("meta", {})
+            message = result.get("transaction", {}).get("message", {})
+            
+            pre_balances = meta.get("preBalances", [])
+            post_balances = meta.get("postBalances", [])
+            account_keys = message.get("accountKeys", [])
+            
+            if not account_keys or len(account_keys) < 2:
+                continue
+            
+            # Find the account that sent SOL (balance decreased)
+            for i, (pre, post) in enumerate(zip(pre_balances, post_balances)):
+                if i >= len(account_keys):
+                    break
+                # Account sent SOL (balance decreased) and it's not our wallet
+                if pre > post and account_keys[i] != wallet_address:
+                    if verbose:
+                        print(f"  {Fore.WHITE}💰 Funder (RPC): {account_keys[i][:20]}...{Style.RESET_ALL}")
+                    return account_keys[i]
+        
+        return None
+        
+    except TimeoutError:
+        if verbose:
+            print(f"  {Fore.YELLOW}⏱️  Funding source trace timeout{Style.RESET_ALL}")
+        return None
+    except Exception as e:
+        if verbose:
+            print(f"  {Fore.YELLOW}⚠️  Funding source error: {e}{Style.RESET_ALL}")
+        return None
+
+
+def check_cabal_topology(
+    holder_addresses: List[str],
+    verbose: bool = True
+) -> Dict[str, Any]:
+    """
+    Check for "Star Topology" cabal pattern among top holders.
+    
+    A star topology is detected when 3+ holders have the same funding source,
+    indicating coordinated buying (cabal behavior).
+    
+    Args:
+        holder_addresses: List of top holder wallet addresses (max 5 checked).
+        verbose: If True, print status messages.
+        
+    Returns:
+        Dict with keys:
+        - is_cabal: Boolean indicating cabal detection
+        - level: DANGER, WARNING, OK, or UNKNOWN
+        - common_funders: List of {funder: str, holder_count: int}
+        - reason: Human-readable explanation
+    """
+    if not holder_addresses:
+        return {
+            "is_cabal": False,
+            "level": LEVEL_UNKNOWN,
+            "common_funders": [],
+            "reason": "No holder addresses provided"
+        }
+    
+    # Limit to top N holders
+    addresses_to_check = holder_addresses[:config.CABAL_TOP_HOLDERS_LIMIT]
+    
+    if verbose:
+        print(f"  {Fore.WHITE}🔍 Tracing funding sources for {len(addresses_to_check)} holders...{Style.RESET_ALL}")
+    
+    # Trace funding source for each holder
+    funder_to_holders: Dict[str, List[str]] = {}
+    unknown_count = 0
+    use_helius = bool(config.HELIUS_API_KEY)
+    
+    for holder in addresses_to_check:
+        try:
+            funder = _get_funding_source(holder, use_helius=use_helius, verbose=verbose)
+            
+            if funder:
+                if funder not in funder_to_holders:
+                    funder_to_holders[funder] = []
+                funder_to_holders[funder].append(holder)
+            else:
+                unknown_count += 1
+        except Exception as e:
+            if verbose:
+                print(f"  {Fore.YELLOW}⚠️  Error tracing {holder[:20]}...: {e}{Style.RESET_ALL}")
+            unknown_count += 1
+    
+    # Check if all traces failed
+    if unknown_count == len(addresses_to_check):
+        return {
+            "is_cabal": False,
+            "level": LEVEL_UNKNOWN,
+            "common_funders": [],
+            "reason": "Could not trace any funding sources (timeout or unavailable)"
+        }
+    
+    # Find common funders with 3+ holders
+    common_funders = []
+    is_cabal = False
+    
+    for funder, holders in funder_to_holders.items():
+        if len(holders) >= config.CABAL_COMMON_FUNDER_THRESHOLD:
+            is_cabal = True
+            common_funders.append({
+                "funder": funder,
+                "holder_count": len(holders),
+                "holders": holders
+            })
+    
+    if is_cabal:
+        level = LEVEL_DANGER
+        funder_summary = ", ".join(f"{cf['funder'][:15]}... ({cf['holder_count']} holders)" for cf in common_funders)
+        reason = f"CABAL DETECTED: Star topology found - {funder_summary}"
+        if verbose:
+            print(f"  {Fore.RED}🚨 {reason}{Style.RESET_ALL}")
+    else:
+        level = LEVEL_OK
+        reason = "No star topology detected - holders have diverse funding sources"
+        if verbose:
+            print(f"  {Fore.GREEN}✅ {reason}{Style.RESET_ALL}")
+    
+    return {
+        "is_cabal": is_cabal,
+        "level": level,
+        "common_funders": common_funders,
+        "reason": reason
+    }
+
+
+# =============================================================================
 # COMPREHENSIVE SECURITY CHECK
 # =============================================================================
 
@@ -642,6 +973,7 @@ def comprehensive_security_check(
     2. Holder concentration check (RPC or RugCheck topHolders)
     3. Honeypot detection (DexScreener txns)
     4. Bundled transaction detection (heuristic)
+    5. Cabal topology detection (star pattern funding)
     
     Args:
         mint_address: The token's mint address.
@@ -657,6 +989,7 @@ def comprehensive_security_check(
         - holder_concentration: Result from check_holder_concentration
         - honeypot: Result from check_honeypot
         - bundled_tx: Result from check_bundled_transactions
+        - cabal_topology: Result from check_cabal_topology
         - danger_flags: List of danger-level issues
         - warning_flags: List of warning-level issues
     """
@@ -674,9 +1007,13 @@ def comprehensive_security_check(
         "holder_concentration": {},
         "honeypot": {},
         "bundled_tx": {},
+        "cabal_topology": {},
         "danger_flags": [],
         "warning_flags": []
     }
+    
+    # Store holder addresses for cabal check (will be populated by holder_concentration check)
+    holder_addresses = []
     
     # Fetch DexScreener data once for reuse
     if token_data is None:
@@ -686,7 +1023,7 @@ def comprehensive_security_check(
     
     # Tier 1: RugCheck basic check
     if verbose:
-        print(f"\n{Fore.WHITE}[1/4] RugCheck Security Scan{Style.RESET_ALL}")
+        print(f"\n{Fore.WHITE}[1/5] RugCheck Security Scan{Style.RESET_ALL}")
     is_safe_rc, reason_rc = check_security(mint_address, verbose=verbose)
     results["rugcheck"] = {"is_safe": is_safe_rc, "reason": reason_rc}
     
@@ -696,7 +1033,13 @@ def comprehensive_security_check(
     
     # Tier 2: Holder concentration check
     if verbose:
-        print(f"\n{Fore.WHITE}[2/4] Holder Concentration Analysis{Style.RESET_ALL}")
+        print(f"\n{Fore.WHITE}[2/5] Holder Concentration Analysis{Style.RESET_ALL}")
+    
+    # Get holders via RPC first to capture addresses for cabal check
+    rpc_holders = _get_holders_from_rpc(mint_address, verbose=verbose)
+    if rpc_holders:
+        holder_addresses = [h.get("address", "") for h in rpc_holders if h.get("address")]
+    
     holder_result = check_holder_concentration(mint_address, verbose=verbose)
     results["holder_concentration"] = holder_result
     
@@ -709,7 +1052,7 @@ def comprehensive_security_check(
     
     # Tier 3: Honeypot detection
     if verbose:
-        print(f"\n{Fore.WHITE}[3/4] Honeypot Detection{Style.RESET_ALL}")
+        print(f"\n{Fore.WHITE}[3/5] Honeypot Detection{Style.RESET_ALL}")
     honeypot_result = check_honeypot(token_data=token_data, verbose=verbose)
     results["honeypot"] = honeypot_result
     
@@ -722,7 +1065,7 @@ def comprehensive_security_check(
     
     # Tier 4: Bundled transaction detection
     if verbose:
-        print(f"\n{Fore.WHITE}[4/4] Bundled Transaction Check{Style.RESET_ALL}")
+        print(f"\n{Fore.WHITE}[4/5] Bundled Transaction Check{Style.RESET_ALL}")
     bundled_result = check_bundled_transactions(token_data=token_data, verbose=verbose)
     results["bundled_tx"] = bundled_result
     
@@ -732,6 +1075,33 @@ def comprehensive_security_check(
     elif bundled_result["level"] == LEVEL_WARNING:
         results["warning_flags"].append(bundled_result["reason"])
         results["safety_score"] -= 10
+    
+    # Tier 5: Cabal topology detection (if enabled)
+    if config.ENABLE_CABAL_TRACING and holder_addresses:
+        if verbose:
+            print(f"\n{Fore.WHITE}[5/5] Cabal Topology Detection{Style.RESET_ALL}")
+        
+        cabal_result = check_cabal_topology(holder_addresses, verbose=verbose)
+        results["cabal_topology"] = cabal_result
+        
+        if cabal_result["level"] == LEVEL_DANGER:
+            results["danger_flags"].append(f"Cabal: {cabal_result['reason']}")
+            results["safety_score"] -= 30
+        elif cabal_result["level"] == LEVEL_WARNING:
+            results["warning_flags"].append(cabal_result["reason"])
+            results["safety_score"] -= 10
+    else:
+        # Cabal check skipped
+        if verbose and not config.ENABLE_CABAL_TRACING:
+            print(f"\n{Fore.WHITE}[5/5] Cabal Detection: SKIPPED (disabled){Style.RESET_ALL}")
+        elif verbose and not holder_addresses:
+            print(f"\n{Fore.WHITE}[5/5] Cabal Detection: SKIPPED (no holder addresses){Style.RESET_ALL}")
+        results["cabal_topology"] = {
+            "is_cabal": False,
+            "level": LEVEL_UNKNOWN,
+            "common_funders": [],
+            "reason": "Cabal check skipped"
+        }
     
     # Calculate overall level
     if len(results["danger_flags"]) > 0:
