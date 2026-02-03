@@ -1,13 +1,206 @@
 """
-Brain Module - Meme Coin Keyword Extraction
-============================================
+Brain Module - Meme Coin Keyword Extraction & LLM Analysis
+===========================================================
 Extracts relevant keywords from Polymarket event titles
 for potential meme coin narrative signals.
+
+Also provides LLM-powered token analysis using Gemini.
 """
 
 import re
-from typing import List, Set
+import time
+import logging
+from pathlib import Path
+from typing import List, Set, Dict, Any, Optional
 
+import google.generativeai as genai
+
+from config import GEMINI_API_KEY
+from rate_limiter import rate_limit_gemini
+
+logger = logging.getLogger(__name__)
+
+# ==============================================================================
+# LLM ANALYSIS CACHE
+# ==============================================================================
+# In-memory cache: { "token_address": (timestamp, result_dict) }
+_llm_cache: Dict[str, tuple] = {}
+LLM_CACHE_TTL_SECONDS = 3600  # 1 hour cache TTL
+
+# Neutral result returned on API failures
+NEUTRAL_RESULT: Dict[str, Any] = {
+    "relevance_score": 50,
+    "authenticity_score": 50,
+    "red_flags": [],
+    "confidence": 0,
+    "reasoning": "Analysis unavailable (API error or timeout)",
+}
+
+# Load prompt template
+_PROMPT_TEMPLATE: Optional[str] = None
+
+
+def _get_prompt_template() -> str:
+    """Load the prompt template from file (cached after first load)."""
+    global _PROMPT_TEMPLATE
+    if _PROMPT_TEMPLATE is None:
+        prompt_path = Path(__file__).parent / "prompts" / "token_analysis.txt"
+        try:
+            _PROMPT_TEMPLATE = prompt_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            logger.error(f"Prompt template not found: {prompt_path}")
+            _PROMPT_TEMPLATE = ""
+    return _PROMPT_TEMPLATE
+
+
+def _is_cache_valid(cache_key: str) -> bool:
+    """Check if a cache entry exists and is still valid (within TTL)."""
+    if cache_key not in _llm_cache:
+        return False
+    timestamp, _ = _llm_cache[cache_key]
+    return (time.time() - timestamp) < LLM_CACHE_TTL_SECONDS
+
+
+def _get_cached_result(cache_key: str) -> Optional[Dict[str, Any]]:
+    """Get cached result if valid, otherwise return None."""
+    if _is_cache_valid(cache_key):
+        _, result = _llm_cache[cache_key]
+        logger.debug(f"Cache hit for token: {cache_key[:16]}...")
+        return result
+    return None
+
+
+def _cache_result(cache_key: str, result: Dict[str, Any]) -> None:
+    """Store result in cache with current timestamp."""
+    _llm_cache[cache_key] = (time.time(), result)
+    logger.debug(f"Cached result for token: {cache_key[:16]}...")
+
+
+@rate_limit_gemini
+def analyze_with_llm(token_data: Dict[str, Any], event_title: str) -> Dict[str, Any]:
+    """
+    Analyze a token using Gemini LLM for relevance and authenticity scoring.
+    
+    Uses the Gemini API with structured JSON output to evaluate:
+    - How relevant the token is to the Polymarket event
+    - Authenticity indicators (genuine project vs scam)
+    - Red flags and concerns
+    - Overall confidence in the analysis
+    
+    Results are cached for 1 hour to avoid redundant API calls.
+    
+    Args:
+        token_data: Dictionary containing token metadata:
+            - address: Token mint address (required)
+            - name: Token name (optional)
+            - symbol: Token symbol (optional)
+            - description: Token description (optional)
+        event_title: The Polymarket event title for context.
+        
+    Returns:
+        Dictionary with analysis results:
+            - relevance_score: 0-100 integer
+            - authenticity_score: 0-100 integer
+            - red_flags: List of concern strings
+            - confidence: 0-100 integer
+            - reasoning: Brief explanation string
+            
+        Returns neutral scores on API failure.
+    """
+    # Extract token address for caching
+    token_address = token_data.get("address", "")
+    if not token_address:
+        logger.warning("No token address provided, returning neutral result")
+        return NEUTRAL_RESULT.copy()
+    
+    # Check cache first
+    cached = _get_cached_result(token_address)
+    if cached is not None:
+        return cached
+    
+    # Validate API key
+    if not GEMINI_API_KEY:
+        logger.error("GEMINI_API_KEY not configured, returning neutral result")
+        return NEUTRAL_RESULT.copy()
+    
+    # Load prompt template
+    prompt_template = _get_prompt_template()
+    if not prompt_template:
+        logger.error("Prompt template not available, returning neutral result")
+        return NEUTRAL_RESULT.copy()
+    
+    # Build the prompt
+    prompt = prompt_template.format(
+        event_title=event_title,
+        token_name=token_data.get("name", "Unknown"),
+        token_symbol=token_data.get("symbol", "???"),
+        token_description=token_data.get("description", "No description available"),
+    )
+    
+    try:
+        # Configure Gemini
+        genai.configure(api_key=GEMINI_API_KEY)
+        
+        # Use gemini-2.5-flash for faster responses (verified to work in learnings.md)
+        model = genai.GenerativeModel("gemini-2.5-flash")
+        
+        # Generate with JSON output mode
+        response = model.generate_content(
+            prompt,
+            generation_config=genai.GenerationConfig(
+                response_mime_type="application/json",
+                temperature=0.3,  # Lower temperature for consistent analysis
+            ),
+        )
+        
+        # Parse response
+        if not response.text:
+            logger.warning("Empty response from Gemini API")
+            return NEUTRAL_RESULT.copy()
+        
+        import json
+        result = json.loads(response.text)
+        
+        # Validate and sanitize the result
+        sanitized_result = {
+            "relevance_score": _clamp(result.get("relevance_score", 50), 0, 100),
+            "authenticity_score": _clamp(result.get("authenticity_score", 50), 0, 100),
+            "red_flags": result.get("red_flags", []) if isinstance(result.get("red_flags"), list) else [],
+            "confidence": _clamp(result.get("confidence", 50), 0, 100),
+            "reasoning": str(result.get("reasoning", "No reasoning provided"))[:500],
+        }
+        
+        # Cache the result
+        _cache_result(token_address, sanitized_result)
+        
+        logger.info(
+            f"LLM analysis complete for {token_data.get('symbol', '???')}: "
+            f"relevance={sanitized_result['relevance_score']}, "
+            f"authenticity={sanitized_result['authenticity_score']}, "
+            f"confidence={sanitized_result['confidence']}"
+        )
+        
+        return sanitized_result
+        
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse Gemini response as JSON: {e}")
+        return NEUTRAL_RESULT.copy()
+    except Exception as e:
+        logger.error(f"Gemini API error: {e}")
+        return NEUTRAL_RESULT.copy()
+
+
+def _clamp(value: Any, min_val: int, max_val: int) -> int:
+    """Clamp a value to a range, converting to int if needed."""
+    try:
+        return max(min_val, min(max_val, int(value)))
+    except (TypeError, ValueError):
+        return (min_val + max_val) // 2
+
+
+# ==============================================================================
+# KEYWORD EXTRACTION
+# ==============================================================================
 
 # Stop words commonly found in Polymarket titles
 STOP_WORDS: Set[str] = {
