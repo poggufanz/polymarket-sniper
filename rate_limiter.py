@@ -9,6 +9,8 @@ Supported rate limits:
 - RugCheck: 10 requests per minute (rpm)
 - Gemini: 60 requests per minute (rpm)
 - GeckoTerminal: 30 requests per minute (rpm)
+- Google News: 2 requests per minute (rpm)
+- GoPlus: 30 requests per minute (rpm)
 """
 
 import time
@@ -61,6 +63,8 @@ _dexscreener_limiter = RateLimiter(30)  # 30 rpm
 _rugcheck_limiter = RateLimiter(10)     # 10 rpm
 _gemini_limiter = RateLimiter(60)       # 60 rpm
 _geckoterminal_limiter = RateLimiter(30)  # 30 rpm
+_google_news_limiter = RateLimiter(2)   # 2 rpm
+_goplus_limiter = RateLimiter(30)       # 30 rpm
 
 
 def rate_limit_dexscreener(func: Callable) -> Callable:
@@ -121,12 +125,46 @@ def rate_limit_geckoterminal(func: Callable) -> Callable:
     Usage:
         @rate_limit_geckoterminal
         async def fetch_ohlcv(pool_address):
-            # API call here
-            pass
+             # API call here
+             pass
     """
     @wraps(func)
     def wrapper(*args, **kwargs) -> Any:
         _geckoterminal_limiter.wait_if_needed()
+        return func(*args, **kwargs)
+    return wrapper
+
+
+def rate_limit_google_news(func: Callable) -> Callable:
+    """
+    Decorator to rate-limit Google News API calls (2 rpm).
+    
+    Usage:
+        @rate_limit_google_news
+        def fetch_news(keyword):
+             # API call here
+             pass
+    """
+    @wraps(func)
+    def wrapper(*args, **kwargs) -> Any:
+        _google_news_limiter.wait_if_needed()
+        return func(*args, **kwargs)
+    return wrapper
+
+
+def rate_limit_goplus(func: Callable) -> Callable:
+    """
+    Decorator to rate-limit GoPlus API calls (30 rpm).
+    
+    Usage:
+        @rate_limit_goplus
+        def check_token_security(token_address):
+             # API call here
+             pass
+    """
+    @wraps(func)
+    def wrapper(*args, **kwargs) -> Any:
+        _goplus_limiter.wait_if_needed()
         return func(*args, **kwargs)
     return wrapper
 
