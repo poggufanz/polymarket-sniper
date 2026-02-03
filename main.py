@@ -1,56 +1,82 @@
 """
-PM-Predict Main Orchestrator
-==============================
-The main script that bridges all modules together:
-- Polymarket Watcher: Fetches hot events
-- Brain: Extracts keywords from titles
-- DEX Hunter: Finds potential tokens
-- Shield: Validates token security
-- Telegram: Sends alerts (optional)
+PM-Predict Main Orchestrator (Async)
+=====================================
+Async event-driven orchestrator that connects all modules together:
+
+- network_layer: WebSocket monitoring for real-time token detection
+- brain: Keyword extraction from Polymarket events + LLM analysis
+- shield: Multi-tier security validation
+- momentum: Pump phase classification and staleness detection
+- scoring: Composite score calculation and alert decision
+- state: Daily alert limiting and persistence
+- config: Centralized configuration
+
+Architecture:
+- Asyncio event loop with two concurrent tasks:
+  1. update_narratives_task: Fetches Polymarket events every 60s, extracts keywords
+  2. WebSocket monitoring: Listens for token events, triggers validation pipeline
+
+Event Flow:
+  Polymarket -> Keywords -> WebSocket filter -> Token Event
+    -> Tier 0: DexScreener data
+    -> Tier 1: Momentum check (EARLY/LATE, staleness)
+    -> Tier 2: Shield security check (SAFE/DANGER)
+    -> Tier 3: Brain LLM analysis (gatekept - only if tiers 1-2 pass)
+    -> Scoring: Composite score calculation
+    -> Alert: State limiting + Telegram notification
 """
 
-import os
-import time
+import asyncio
+import logging
+import sys
 import requests
-from typing import Optional
 from datetime import datetime
-from colorama import init, Fore, Back, Style
+from typing import Optional, Dict, Any
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+
+from colorama import init, Fore, Style
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
 
 # Local modules
+import config
+from network_layer import WebSocketManager, TokenEvent
 from polymarket_watcher import fetch_events
-from brain import extract_keywords
-from dex_hunter import search_potential_tokens, format_usd
-from shield import check_security
+from brain import extract_keywords, analyze_with_llm
+from shield import comprehensive_security_check, _get_token_data_from_dexscreener
+from momentum import classify_pump_phase, check_staleness, calculate_price_velocity, get_buy_sell_ratio
+from scoring import calculate_composite_score, should_alert, format_score_telegram_message
+from state import StateManager
+from dex_hunter import format_usd
 
 # Initialize colorama
 init(autoreset=True)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG if config.VERBOSE_LOGGING else logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger(__name__)
+
+# Suppress noisy third-party loggers
+logging.getLogger("websockets").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 
 # Timing
-MAIN_LOOP_INTERVAL_SECONDS = 60  # How often to check for new events
-ERROR_RETRY_DELAY_SECONDS = 10
+NARRATIVE_UPDATE_INTERVAL_SECONDS = 60  # How often to fetch Polymarket events
+MIN_VOLUME_FOR_NARRATIVE = 100_000  # Only use events with >$100K volume for narratives
 
-# Filters
-MIN_VOLUME_FOR_ALERT = 1_000_000  # Only alert on events with >$1M volume
-MAX_TOKENS_TO_CHECK = 10  # Limit security checks per cycle
-
-# Noise Gate: Token freshness and liquidity filters
-MIN_LIQUIDITY_FOR_ALERT = 5_000  # Only alert if liquidity > $5K
-MAX_TOKEN_AGE_HOURS = 24  # Only alert on tokens created < 24h ago
-
-# Telegram (set via environment or .env file)
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-
-# Track already-alerted tokens to avoid spam
-ALERTED_TOKENS: set = set()
+# Thread pool for running blocking I/O in async context
+_executor = ThreadPoolExecutor(max_workers=4)
 
 
 # =============================================================================
@@ -67,271 +93,419 @@ def send_telegram_alert(message: str) -> bool:
     Returns:
         True if sent successfully, False otherwise.
     """
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHAT_ID:
+        logger.warning("Telegram not configured (missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID)")
         return False
     
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage"
     
     try:
         response = requests.post(
             url,
             json={
-                "chat_id": TELEGRAM_CHAT_ID,
+                "chat_id": config.TELEGRAM_CHAT_ID,
                 "text": message,
                 "parse_mode": "Markdown",
                 "disable_web_page_preview": False,
             },
-            timeout=10
+            timeout=config.API_TIMEOUT_SECONDS
         )
-        return response.status_code == 200
+        if response.status_code == 200:
+            logger.info("Telegram alert sent successfully")
+            return True
+        else:
+            logger.error(f"Telegram API error: {response.status_code} - {response.text}")
+            return False
     except Exception as e:
-        print(f"{Fore.YELLOW}⚠️  Telegram error: {e}{Style.RESET_ALL}")
+        logger.error(f"Telegram error: {e}")
         return False
 
 
 # =============================================================================
-# ALERT DISPLAY
+# NARRATIVE UPDATE TASK
 # =============================================================================
 
-def display_alpha_alert(token: dict, event_title: str, security_reason: str) -> None:
+async def update_narratives_task(manager: WebSocketManager) -> None:
     """
-    Display a big, bold, colorful alert for a validated alpha token.
+    Background task: Fetch Polymarket events every 60s, extract keywords,
+    and update WebSocket manager narratives.
     
     Args:
-        token: Token info dictionary.
-        event_title: The Polymarket event that triggered this.
-        security_reason: Security check result.
+        manager: WebSocketManager instance to update narratives on.
     """
-    print("\n")
-    print(f"{Back.GREEN}{Fore.BLACK}{Style.BRIGHT}")
-    print("=" * 75)
-    print("   🚀🚀🚀  SCAM-FREE ALPHA DETECTED  🚀🚀🚀")
-    print("=" * 75)
-    print(f"{Style.RESET_ALL}")
-    
-    print(f"{Fore.WHITE}📰 Trigger: {Fore.YELLOW}{event_title}{Style.RESET_ALL}")
-    print()
-    print(f"{Fore.WHITE}🪙 Token: {Fore.CYAN}{token['name']} ({token['symbol']}){Style.RESET_ALL}")
-    print(f"{Fore.WHITE}⛓️  Chain: {Fore.MAGENTA}{token['chain'].upper()}{Style.RESET_ALL}")
-    print(f"{Fore.WHITE}💰 Price: {Fore.GREEN}${token['price_usd']}{Style.RESET_ALL}")
-    print(f"{Fore.WHITE}💧 Liquidity: {Fore.CYAN}{format_usd(token['liquidity_usd'])}{Style.RESET_ALL}")
-    print(f"{Fore.WHITE}📊 24h Volume: {Fore.CYAN}{format_usd(token['volume_24h'])}{Style.RESET_ALL}")
-    print(f"{Fore.WHITE}🛡️  Security: {Fore.GREEN}{security_reason}{Style.RESET_ALL}")
-    print()
-    print(f"{Fore.WHITE}📋 Contract Address:{Style.RESET_ALL}")
-    print(f"{Back.WHITE}{Fore.BLACK} {token['address']} {Style.RESET_ALL}")
-    print()
-    if token.get("url"):
-        print(f"{Fore.BLUE}🔗 DexScreener: {token['url']}{Style.RESET_ALL}")
-    
-    print(f"{Back.GREEN}{Fore.BLACK}{Style.BRIGHT}")
-    print("=" * 75)
-    print(f"{Style.RESET_ALL}\n")
-
-
-def format_telegram_message(token: dict, event_title: str) -> str:
-    """Format a Telegram alert message."""
-    return f"""🚀 *ALPHA DETECTED* 🚀
-
-📰 *Trigger:* {event_title}
-
-🪙 *Token:* {token['name']} ({token['symbol']})
-⛓️ *Chain:* {token['chain'].upper()}
-💰 *Price:* ${token['price_usd']}
-💧 *Liquidity:* {format_usd(token['liquidity_usd'])}
-📊 *Volume 24h:* {format_usd(token['volume_24h'])}
-
-📋 *Contract:*
-`{token['address']}`
-
-🔗 [View on DexScreener]({token.get('url', '')})
-"""
-
-
-# =============================================================================
-# MAIN ORCHESTRATION
-# =============================================================================
-
-def process_event(event: dict) -> list[dict]:
-    """
-    Process a single Polymarket event:
-    1. Extract keywords
-    2. Search for tokens
-    3. Validate security
-    4. Return safe tokens
-    
-    Args:
-        event: Event dictionary from Polymarket API.
-        
-    Returns:
-        List of validated, safe tokens.
-    """
-    title = event.get("title", "")
-    volume = float(event.get("volume", 0))
-    
-    # Skip low-volume events
-    if volume < MIN_VOLUME_FOR_ALERT:
-        return []
-    
-    print(f"\n{Fore.CYAN}📌 Processing: {Fore.WHITE}{title}{Style.RESET_ALL}")
-    print(f"   Volume: {format_usd(volume)}")
-    
-    # Step 1: Extract keywords
-    keywords = extract_keywords(title)
-    if not keywords:
-        print(f"   {Fore.YELLOW}No keywords extracted, skipping{Style.RESET_ALL}")
-        return []
-    
-    print(f"   Keywords: {Fore.YELLOW}{keywords}{Style.RESET_ALL}")
-    
-    # Step 2: Search for tokens
-    tokens = search_potential_tokens(keywords)
-    if not tokens:
-        print(f"   {Fore.YELLOW}No tokens found{Style.RESET_ALL}")
-        return []
-    
-    print(f"   {Fore.GREEN}Found {len(tokens)} potential tokens{Style.RESET_ALL}")
-    
-    # Step 3: Security check (only for Solana tokens, limit to avoid rate limits)
-    safe_tokens = []
-    checked = 0
-    current_time_ms = int(datetime.now().timestamp() * 1000)
-    max_age_ms = MAX_TOKEN_AGE_HOURS * 60 * 60 * 1000  # Convert hours to milliseconds
-    
-    for token in tokens[:MAX_TOKENS_TO_CHECK]:
-        address = token.get("address", "")
-        chain = token.get("chain", "").lower()
-        liquidity = float(token.get("liquidity_usd", 0) or 0)
-        pair_created_at = token.get("pair_created_at", 0)
-        
-        # Skip if already alerted
-        if address.lower() in ALERTED_TOKENS:
-            continue
-        
-        # NOISE GATE: Check liquidity threshold
-        if liquidity < MIN_LIQUIDITY_FOR_ALERT:
-            print(f"   {Fore.YELLOW}⏭️  Skipping {token['symbol']}: Low liquidity (${liquidity:.0f}){Style.RESET_ALL}")
-            continue
-        
-        # NOISE GATE: Check token age (must be fresh < 24h)
-        if pair_created_at > 0:
-            age_ms = current_time_ms - pair_created_at
-            age_hours = age_ms / (1000 * 60 * 60)
-            if age_hours > MAX_TOKEN_AGE_HOURS:
-                print(f"   {Fore.YELLOW}⏭️  Skipping {token['symbol']}: Stale token ({age_hours:.1f}h old){Style.RESET_ALL}")
-                continue
-        
-        # Only check Solana tokens with RugCheck (others pass by default)
-        if chain == "solana":
-            print(f"\n   {Fore.WHITE}🛡️  Checking: {token['symbol']} ({address[:20]}...){Style.RESET_ALL}")
-            is_safe, reason = check_security(address, verbose=True)
-            
-            if is_safe:
-                token["security_reason"] = reason
-                safe_tokens.append(token)
-            checked += 1
-        else:
-            # Non-Solana tokens: pass with warning
-            token["security_reason"] = f"No RugCheck for {chain} (manual DYOR)"
-            safe_tokens.append(token)
-    
-    return safe_tokens
-
-
-def run_main_loop() -> None:
-    """
-    Main orchestration loop:
-    1. Fetch hot events from Polymarket
-    2. Process each event
-    3. Display and send alerts for safe tokens
-    """
-    print(f"\n{Fore.CYAN}{Style.BRIGHT}")
-    print("╔═══════════════════════════════════════════════════════════════════════╗")
-    print("║             PM-PREDICT - Polymarket Alpha Scanner                     ║")
-    print("║                    Press Ctrl+C to stop                               ║")
-    print("╚═══════════════════════════════════════════════════════════════════════╝")
-    print(f"{Style.RESET_ALL}")
-    
-    # Check Telegram config
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        print(f"{Fore.GREEN}✅ Telegram alerts enabled{Style.RESET_ALL}")
-    else:
-        print(f"{Fore.YELLOW}⚠️  Telegram not configured (set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID){Style.RESET_ALL}")
-    
-    print(f"{Fore.WHITE}🔄 Scanning every {MAIN_LOOP_INTERVAL_SECONDS}s | Min volume: {format_usd(MIN_VOLUME_FOR_ALERT)}{Style.RESET_ALL}")
-    print()
-    
-    cycle_count = 0
+    logger.info("Starting narrative update task...")
     
     while True:
         try:
-            cycle_count += 1
-            timestamp = datetime.now().strftime("%H:%M:%S")
-            
-            print(f"\n{Fore.BLUE}{'='*75}")
-            print(f"⏰ Cycle #{cycle_count} | {timestamp}")
-            print(f"{'='*75}{Style.RESET_ALL}")
-            
-            # Fetch events
-            print(f"\n{Fore.CYAN}📡 Fetching Polymarket events...{Style.RESET_ALL}")
-            events = fetch_events()
+            # Run blocking fetch_events in executor
+            loop = asyncio.get_running_loop()
+            events = await loop.run_in_executor(_executor, fetch_events)
             
             if not events:
-                print(f"{Fore.YELLOW}No events fetched, retrying...{Style.RESET_ALL}")
-                time.sleep(ERROR_RETRY_DELAY_SECONDS)
+                logger.warning("No Polymarket events fetched")
+                await asyncio.sleep(NARRATIVE_UPDATE_INTERVAL_SECONDS)
                 continue
             
-            print(f"{Fore.GREEN}✓ Fetched {len(events)} events{Style.RESET_ALL}")
+            # Extract keywords from high-volume events
+            all_keywords = set()
+            events_processed = 0
             
-            # Process top events (limit to avoid overload)
-            for event in events[:5]:  # Top 5 by volume
-                try:
-                    safe_tokens = process_event(event)
-                    event_title = event.get("title", "Unknown Event")
-                    
-                    # Alert for each safe token
-                    for token in safe_tokens:
-                        address = token.get("address", "").lower()
-                        
-                        # Avoid duplicate alerts
-                        if address in ALERTED_TOKENS:
-                            continue
-                        
-                        ALERTED_TOKENS.add(address)
-                        
-                        # Display console alert
-                        display_alpha_alert(
-                            token,
-                            event_title,
-                            token.get("security_reason", "Passed checks")
-                        )
-                        
-                        # Send Telegram alert
-                        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-                            msg = format_telegram_message(token, event_title)
-                            if send_telegram_alert(msg):
-                                print(f"{Fore.GREEN}📱 Telegram alert sent!{Style.RESET_ALL}")
-                
-                except Exception as e:
-                    print(f"{Fore.RED}❌ Error processing event: {e}{Style.RESET_ALL}")
+            for event in events:
+                volume = float(event.get("volume", 0) or 0)
+                if volume < MIN_VOLUME_FOR_NARRATIVE:
                     continue
+                
+                title = event.get("title", "")
+                keywords = extract_keywords(title)
+                
+                if keywords:
+                    all_keywords.update(kw.lower() for kw in keywords)
+                    events_processed += 1
             
-            # Wait before next cycle
-            print(f"\n{Fore.BLUE}💤 Sleeping {MAIN_LOOP_INTERVAL_SECONDS}s until next scan...{Style.RESET_ALL}")
-            time.sleep(MAIN_LOOP_INTERVAL_SECONDS)
+            if all_keywords:
+                # Update WebSocket manager with new narratives
+                manager.update_narratives(list(all_keywords))
+                logger.info(
+                    f"Narratives updated: {len(all_keywords)} keywords from "
+                    f"{events_processed} events"
+                )
+                logger.debug(f"Keywords: {sorted(all_keywords)[:10]}...")
+            else:
+                logger.warning("No keywords extracted from events")
             
-        except KeyboardInterrupt:
-            raise
         except Exception as e:
-            print(f"{Fore.RED}❌ Main loop error: {e}{Style.RESET_ALL}")
-            print(f"{Fore.YELLOW}⚠️  Retrying in {ERROR_RETRY_DELAY_SECONDS}s...{Style.RESET_ALL}")
-            time.sleep(ERROR_RETRY_DELAY_SECONDS)
+            logger.error(f"Narrative update task error: {e}")
+        
+        await asyncio.sleep(NARRATIVE_UPDATE_INTERVAL_SECONDS)
+
+
+# =============================================================================
+# TOKEN EVENT HANDLER (Tiered Validation Pipeline)
+# =============================================================================
+
+async def handle_token_event(event: TokenEvent) -> None:
+    """
+    Handle a token event detected by WebSocket.
+    
+    Tiered validation pipeline:
+    1. Narrative Check: Already done by WS manager, just log
+    2. Tier 0: Fetch DexScreener data
+    3. Tier 1 (Momentum): EARLY/LATE classification, staleness check
+    4. Tier 2 (Shield): Comprehensive security check
+    5. Tier 3 (Brain): LLM analysis (gatekept - only if tiers 1-2 pass)
+    6. Scoring: Composite score calculation
+    7. Alert: State limiting + Telegram notification
+    
+    Args:
+        event: TokenEvent from network_layer
+    """
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    
+    logger.info(f"\n{'='*60}")
+    logger.info(f"TOKEN EVENT RECEIVED @ {timestamp}")
+    logger.info(f"{'='*60}")
+    logger.info(f"Symbol: {event.token_symbol or 'UNKNOWN'}")
+    logger.info(f"Name: {event.token_name or 'Unknown'}")
+    logger.info(f"Mint: {event.mint_address or 'N/A'}")
+    logger.info(f"Matched Narrative: {event.matched_narrative or 'none'}")
+    logger.info(f"Program: {event.program_id}")
+    
+    # Get mint address - required for downstream checks
+    mint_address = event.mint_address
+    if not mint_address:
+        logger.warning("No mint address available, skipping event")
+        return
+    
+    # Check if already alerted on this token today
+    if StateManager.was_alerted_today(mint_address):
+        logger.info(f"Already alerted on {event.token_symbol or mint_address[:16]} today, skipping")
+        return
+    
+    # Check if we have alerts remaining
+    if not StateManager.can_alert(config.MAX_ALERTS_PER_DAY):
+        logger.warning(f"Daily alert limit reached ({config.MAX_ALERTS_PER_DAY}), skipping")
+        return
+    
+    try:
+        # =================================================================
+        # TIER 0: Fetch DexScreener Data
+        # =================================================================
+        logger.info(f"\n[TIER 0] Fetching DexScreener data...")
+        
+        # Run blocking DexScreener fetch in executor
+        loop = asyncio.get_running_loop()
+        token_data = await loop.run_in_executor(
+            _executor,
+            partial(_get_token_data_from_dexscreener, mint_address, verbose=False)
+        )
+        
+        if not token_data:
+            logger.warning(f"No DexScreener data for {mint_address[:16]}, skipping")
+            return
+        
+        # Extract basic info
+        token_name = token_data.get("baseToken", {}).get("name", event.token_name or "Unknown")
+        token_symbol = token_data.get("baseToken", {}).get("symbol", event.token_symbol or "???")
+        liquidity = float(token_data.get("liquidity", {}).get("usd", 0) or 0)
+        
+        logger.info(f"Token: {token_name} ({token_symbol})")
+        logger.info(f"Liquidity: {format_usd(liquidity)}")
+        
+        # Quick liquidity check
+        if liquidity < config.MIN_LIQUIDITY_USD:
+            logger.info(f"Liquidity ${liquidity:.0f} below threshold ${config.MIN_LIQUIDITY_USD}, skipping")
+            return
+        
+        # =================================================================
+        # TIER 1: Momentum Check (EARLY/LATE, Staleness)
+        # =================================================================
+        logger.info(f"\n[TIER 1] Momentum Analysis...")
+        
+        pump_phase = classify_pump_phase(token_data)
+        is_stale = check_staleness(token_data)
+        price_velocity = calculate_price_velocity(token_data)
+        buy_sell_ratio = get_buy_sell_ratio(token_data)
+        
+        logger.info(f"Pump Phase: {pump_phase}")
+        logger.info(f"Price Velocity: {price_velocity:.2f}%")
+        logger.info(f"Buy/Sell Ratio: {buy_sell_ratio or 'N/A'}")
+        logger.info(f"Is Stale: {is_stale}")
+        
+        # EARLY phase required
+        if pump_phase != "EARLY":
+            logger.info(f"Pump phase is {pump_phase} (not EARLY), skipping")
+            return
+        
+        # Not stale required
+        if is_stale:
+            logger.info("Token is stale (old + flat price), skipping")
+            return
+        
+        # =================================================================
+        # TIER 2: Shield Security Check
+        # =================================================================
+        logger.info(f"\n[TIER 2] Security Analysis...")
+        
+        # Run blocking security check in executor
+        shield_result = await loop.run_in_executor(
+            _executor,
+            partial(comprehensive_security_check, mint_address, token_data, verbose=False)
+        )
+        
+        is_safe = shield_result.get("is_safe", False)
+        safety_score = shield_result.get("safety_score", 0)
+        danger_flags = shield_result.get("danger_flags", [])
+        warning_flags = shield_result.get("warning_flags", [])
+        
+        logger.info(f"Is Safe: {is_safe}")
+        logger.info(f"Safety Score: {safety_score}/100")
+        logger.info(f"Danger Flags: {len(danger_flags)}")
+        logger.info(f"Warning Flags: {len(warning_flags)}")
+        
+        if not is_safe:
+            logger.info(f"Security check FAILED: {danger_flags}")
+            return
+        
+        # =================================================================
+        # TIER 3: Brain LLM Analysis (Gatekept)
+        # =================================================================
+        logger.info(f"\n[TIER 3] LLM Analysis (Gatekept)...")
+        
+        # Prepare token data for LLM
+        llm_token_data = {
+            "address": mint_address,
+            "name": token_name,
+            "symbol": token_symbol,
+            "description": token_data.get("info", {}).get("description", ""),
+        }
+        
+        # Use matched narrative as event context
+        event_title = event.matched_narrative or "Unknown Narrative"
+        
+        # Run blocking LLM call in executor
+        brain_result = await loop.run_in_executor(
+            _executor,
+            partial(analyze_with_llm, llm_token_data, event_title)
+        )
+        
+        relevance_score = brain_result.get("relevance_score", 50)
+        authenticity_score = brain_result.get("authenticity_score", 50)
+        confidence = brain_result.get("confidence", 0)
+        
+        logger.info(f"Relevance Score: {relevance_score}/100")
+        logger.info(f"Authenticity Score: {authenticity_score}/100")
+        logger.info(f"Confidence: {confidence}%")
+        
+        # =================================================================
+        # SCORING: Composite Score Calculation
+        # =================================================================
+        logger.info(f"\n[SCORING] Calculating composite score...")
+        
+        momentum_result = {
+            "price_velocity": price_velocity,
+            "buy_sell_ratio": buy_sell_ratio if buy_sell_ratio and buy_sell_ratio != float('inf') else 1.0,
+        }
+        
+        score_data = calculate_composite_score(
+            shield_result=shield_result,
+            momentum_result=momentum_result,
+            brain_result=brain_result,
+            pump_phase=pump_phase
+        )
+        
+        composite_score = score_data.get("composite_score", 0)
+        
+        logger.info(f"Composite Score: {composite_score}/100")
+        logger.info(f"Safety: {score_data.get('safety_score')}/100")
+        logger.info(f"Timing: {score_data.get('timing_score')}/100")
+        logger.info(f"Momentum: {score_data.get('momentum_score')}/100")
+        logger.info(f"Relevance: {score_data.get('relevance_score')}/100")
+        
+        # Check if alert should be sent
+        if not should_alert(score_data):
+            logger.info("Composite score below alert threshold, skipping")
+            return
+        
+        # =================================================================
+        # ALERT: State Limiting + Telegram Notification
+        # =================================================================
+        logger.info(f"\n[ALERT] Sending alert...")
+        
+        # DRY RUN mode check
+        if config.DRY_RUN:
+            logger.info("DRY RUN mode - would send alert but skipping")
+            print(f"\n{Fore.YELLOW}{'='*60}")
+            print(f"[DRY RUN] ALERT WOULD BE SENT")
+            print(f"{'='*60}{Style.RESET_ALL}")
+            print(format_score_telegram_message(
+                score_data,
+                token_name=token_name,
+                token_symbol=token_symbol,
+                token_address=mint_address
+            ))
+            return
+        
+        # Record alert in state (prevents duplicates)
+        if not StateManager.record_alert(mint_address, token_symbol):
+            logger.warning("Failed to record alert in state, may be duplicate")
+            return
+        
+        # Format Telegram message
+        telegram_message = format_score_telegram_message(
+            score_data,
+            token_name=token_name,
+            token_symbol=token_symbol,
+            token_address=mint_address
+        )
+        
+        # Add DexScreener link
+        dex_url = token_data.get("url", f"https://dexscreener.com/solana/{mint_address}")
+        telegram_message += f"\n\n🔗 [View on DexScreener]({dex_url})"
+        
+        # Send Telegram alert
+        if send_telegram_alert(telegram_message):
+            logger.info(f"✅ Alert sent for {token_symbol}")
+            
+            # Print to console as well
+            print(f"\n{Fore.GREEN}{'='*60}")
+            print(f"🚀 ALPHA ALERT SENT!")
+            print(f"{'='*60}{Style.RESET_ALL}")
+            print(f"Token: {token_name} ({token_symbol})")
+            print(f"Composite Score: {composite_score}/100")
+            print(f"Alerts Remaining: {StateManager.get_alerts_remaining(config.MAX_ALERTS_PER_DAY)}")
+        else:
+            logger.error(f"Failed to send Telegram alert for {token_symbol}")
+        
+    except Exception as e:
+        logger.error(f"Error processing token event: {e}", exc_info=True)
+
+
+# =============================================================================
+# MAIN ASYNC ORCHESTRATOR
+# =============================================================================
+
+async def run_orchestrator() -> None:
+    """
+    Main async orchestrator function.
+    
+    Starts two concurrent tasks:
+    1. Narrative update task (Polymarket -> Keywords)
+    2. WebSocket monitoring (Token events -> Validation pipeline)
+    """
+    print(f"\n{Fore.CYAN}{Style.BRIGHT}")
+    print("╔═══════════════════════════════════════════════════════════════════════╗")
+    print("║       PM-PREDICT - Async Polymarket Alpha Scanner (v2.0)              ║")
+    print("║                       Press Ctrl+C to stop                            ║")
+    print("╚═══════════════════════════════════════════════════════════════════════╝")
+    print(f"{Style.RESET_ALL}")
+    
+    # Validate configuration
+    errors = config.validate_config()
+    if errors:
+        for error in errors:
+            print(f"{Fore.RED}❌ {error}{Style.RESET_ALL}")
+        if not config.DRY_RUN:
+            print(f"{Fore.YELLOW}⚠️  Running in limited mode (some features disabled){Style.RESET_ALL}")
+    
+    # Check Telegram config
+    if config.TELEGRAM_BOT_TOKEN and config.TELEGRAM_CHAT_ID:
+        print(f"{Fore.GREEN}✅ Telegram alerts enabled{Style.RESET_ALL}")
+    else:
+        print(f"{Fore.YELLOW}⚠️  Telegram not configured (alerts will be console-only){Style.RESET_ALL}")
+    
+    # Check DRY RUN mode
+    if config.DRY_RUN:
+        print(f"{Fore.YELLOW}⚠️  DRY RUN mode enabled (no real alerts will be sent){Style.RESET_ALL}")
+    
+    # Print state info
+    alerts_remaining = StateManager.get_alerts_remaining(config.MAX_ALERTS_PER_DAY)
+    print(f"{Fore.WHITE}📊 Alerts remaining today: {alerts_remaining}/{config.MAX_ALERTS_PER_DAY}{Style.RESET_ALL}")
+    print()
+    
+    # Create WebSocket manager
+    manager = WebSocketManager()
+    narrative_task = None
+    
+    try:
+        # Start narrative update task
+        narrative_task = asyncio.create_task(update_narratives_task(manager))
+        
+        # Give narrative task a moment to populate initial keywords
+        await asyncio.sleep(2)
+        
+        # Start WebSocket monitoring with event handler
+        logger.info("Starting WebSocket monitoring...")
+        await manager.start_monitoring(handle_token_event)
+        
+    except asyncio.CancelledError:
+        logger.info("Orchestrator cancelled")
+    finally:
+        await manager.stop_monitoring()
+        if narrative_task:
+            narrative_task.cancel()
+        
+        # Print final stats
+        stats = manager.stats
+        print(f"\n{Fore.CYAN}{'='*60}")
+        print(f"Session Statistics")
+        print(f"{'='*60}{Style.RESET_ALL}")
+        print(f"Events Received: {stats.get('events_received', 0)}")
+        print(f"Events Matched: {stats.get('events_matched', 0)}")
+        print(f"Connection Attempts: {stats.get('connection_attempts', 0)}")
+        
+        # Print state info
+        alerts_count, _, _ = StateManager.get_alert_history()
+        print(f"Alerts Sent Today: {alerts_count}/{config.MAX_ALERTS_PER_DAY}")
 
 
 def main() -> None:
     """Entry point with graceful shutdown handling."""
+    # Check for TELEGRAM_BOT_TOKEN requirement
+    if not config.TELEGRAM_BOT_TOKEN and not config.DRY_RUN:
+        print(f"{Fore.YELLOW}⚠️  TELEGRAM_BOT_TOKEN not set. Set it or use DRY_RUN=true{Style.RESET_ALL}")
+    
     try:
-        run_main_loop()
+        asyncio.run(run_orchestrator())
     except KeyboardInterrupt:
         print(f"\n{Fore.YELLOW}👋 Scanner stopped. Goodbye!{Style.RESET_ALL}")
 
