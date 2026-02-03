@@ -14,7 +14,8 @@ import logging
 from pathlib import Path
 from typing import List, Set, Dict, Any, Optional
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 from config import GEMINI_API_KEY
 from rate_limiter import rate_limit_gemini
@@ -139,16 +140,14 @@ def analyze_with_llm(token_data: Dict[str, Any], event_title: str) -> Dict[str, 
     )
     
     try:
-        # Configure Gemini
-        genai.configure(api_key=GEMINI_API_KEY)
+        # Initialize Gemini client
+        client = genai.Client(api_key=GEMINI_API_KEY)
         
-        # Use gemini-2.5-flash for faster responses (verified to work in learnings.md)
-        model = genai.GenerativeModel("gemini-2.5-flash")
-        
-        # Generate with JSON output mode
-        response = model.generate_content(
-            prompt,
-            generation_config=genai.GenerationConfig(
+        # Generate with JSON output mode using new client API
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 temperature=0.3,  # Lower temperature for consistent analysis
             ),

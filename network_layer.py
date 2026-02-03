@@ -294,6 +294,17 @@ class WebSocketManager:
             logger.warning(f"Invalid JSON message received")
             return
         
+        # --- FIX: Handle jika data bukan dict (misal subscription ID berupa int) ---
+        if not isinstance(data, dict):
+            if config.VERBOSE_LOGGING:
+                logger.info(f"Received non-dict message: {data}")
+            return
+        # ------------------------------------------------------------------------
+        
+        # Handle subscription confirmation (result: ID)
+        if "result" in data:
+            return
+        
         # Handle subscription notifications
         if data.get("method") != "logsNotification":
             return
