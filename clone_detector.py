@@ -32,6 +32,7 @@ try:
     FUZZYWUZZY_AVAILABLE = True
 except ImportError:
     FUZZYWUZZY_AVAILABLE = False
+    fuzz = None
     print(f"{Fore.YELLOW}WARNING: fuzzywuzzy not installed. Clone detection will be disabled.{Style.RESET_ALL}")
     print(f"{Fore.YELLOW}   Install with: pip install fuzzywuzzy python-Levenshtein{Style.RESET_ALL}")
 
